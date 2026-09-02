@@ -76,6 +76,7 @@ def export_split(
     payload.update(
         raw_feature_names=np.asarray(raw_feature_names(model.online.ablation)),
         symbol=np.asarray([dataset.config["data"]["symbol"]] * len(dataset)),
+        series_id=np.asarray([dataset.config["data"]["series_id"]] * len(dataset)),
         split=np.asarray([dataset.split] * len(dataset)),
         design_version=np.asarray([dataset.config["design_version"]]),
         ablation=np.asarray([model.online.ablation]),

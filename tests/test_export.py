@@ -46,4 +46,6 @@ def test_export_preserves_timestamp_provenance_and_hashes(
         assert exported["weekly_partial_source_max"][0] == 4
         assert exported["checkpoint_sha256"][0] == "checkpoint"
         assert exported["source_sha256"][0] == "source"
+        assert exported["symbol"][0] == "JM"
+        assert exported["series_id"][0] == "8Y_DCE_JM2601"
         assert exported["z_target_h1"].shape == (1, 16)

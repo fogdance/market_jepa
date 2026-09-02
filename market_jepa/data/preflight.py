@@ -129,6 +129,8 @@ def build_preflight_report(data: MarketData, config: dict[str, Any], top_n: int 
     report = {
         "source": {
             "path": str(source_path),
+            "symbol": config["data"]["symbol"],
+            "series_id": config["data"]["series_id"],
             "sha256": file_sha256(source_path),
             "rows": int(len(frame)),
             "timestamp_start": frame.iloc[0]["timestamp"].isoformat(),

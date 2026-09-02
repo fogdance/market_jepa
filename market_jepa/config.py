@@ -9,10 +9,11 @@ import yaml
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "experiment_id": "market_jepa_v0_default",
-    "design_version": "0.6.0",
+    "design_version": "0.6.1",
     "data": {
         "csv_path": "8Y_DCE_JM2601_1m.csv",
-        "symbol": "JM2601",
+        "symbol": "JM",
+        "series_id": "8Y_DCE_JM2601",
         "minute_context_length": 512,
         "horizons": [16, 64, 256],
         "realized_vol_window": 32,
@@ -125,8 +126,8 @@ def validate_config(config: dict[str, Any], smoke: bool | None = None) -> None:
     missing = required.difference(config)
     if missing:
         raise ValueError(f"configuration missing keys: {sorted(missing)}")
-    if config["design_version"] != "0.6.0":
-        raise ValueError("implementation accepts only frozen design_version 0.6.0")
+    if config["design_version"] != "0.6.1":
+        raise ValueError("implementation accepts only frozen design_version 0.6.1")
     is_smoke = config.get("profile") == "smoke" if smoke is None else smoke
     if not is_smoke:
         expected = deepcopy(DEFAULT_CONFIG)

@@ -5,7 +5,7 @@ import pytest
 
 from market_jepa.config import DEFAULT_CONFIG
 from market_jepa.eval.metrics import block_bootstrap, block_shuffle_indices, nearest_indices
-from market_jepa.eval.pipeline import evaluate_exports
+from market_jepa.eval.pipeline import _future_report, evaluate_exports
 from market_jepa.eval.raw_baseline import raw_baseline_features, raw_feature_names
 
 
@@ -42,6 +42,37 @@ def test_block_bootstrap_is_reproducible() -> None:
     first = block_bootstrap(effects, blocks, samples=100, seed=42)
     second = block_bootstrap(effects, blocks, samples=100, seed=42)
     assert first == second
+    assert first["effect"] == pytest.approx(effects.mean())
+
+
+def test_block_bootstrap_preserves_sample_weighted_estimand() -> None:
+    effects = np.concatenate([np.ones(100), np.asarray([-10.0])])
+    blocks = np.concatenate([np.zeros(100, dtype=int), np.asarray([1])])
+    result = block_bootstrap(effects, blocks, samples=1_000, seed=42)
+    assert result["effect"] == pytest.approx(effects.mean())
+    assert result["effect"] == pytest.approx(0.8910891089108911)
+
+
+def test_prediction_effect_equals_difference_of_mean_errors() -> None:
+    target = np.asarray([[1.0, 0.0], [0.8, 0.2], [0.0, 1.0]])
+    prediction = np.asarray([[0.9, 0.1], [0.5, 0.5], [0.1, 0.9]])
+    persistence = np.asarray([[0.7, 0.3], [1.0, 0.0], [0.5, 0.5]])
+    timestamps = np.asarray(
+        ["2024-01-02T09:01", "2024-01-02T09:02", "2024-01-03T09:01"],
+        dtype="datetime64[ns]",
+    ).astype(np.int64)
+    train = {"z_target_h1": target}
+    data = {
+        "z_target_h1": target,
+        "z_prediction_h1": prediction,
+        "z_persistence_h1": persistence,
+        "timestamp_ns": timestamps,
+        "trading_day_ns": timestamps.astype("datetime64[ns]").astype("datetime64[D]").astype(np.int64),
+    }
+    report = _future_report(train, data, horizon=1, bootstrap_samples=100, seed=42)
+    assert report["persistence_improvement"]["effect"] == pytest.approx(
+        report["persistence_cosine_error"] - report["learned_cosine_error"]
+    )
 
 
 def test_block_shuffle_never_crosses_calendar_month_or_session() -> None:
@@ -61,6 +92,7 @@ def test_block_shuffle_never_crosses_calendar_month_or_session() -> None:
     session = timestamps.astype("datetime64[h]").astype(int) % 24 >= 18
     assert np.all(month[shuffled] == month)
     assert np.all(session[shuffled] == session)
+    assert np.all(shuffled != np.arange(len(shuffled)))
     assert set(shuffled[:2]) == {0, 1}
     assert set(shuffled[4:]) == {4, 5}
 
@@ -70,8 +102,10 @@ def test_evaluation_rejects_latents_from_another_checkpoint(tmp_path) -> None:
         np.savez_compressed(
             tmp_path / f"{split}.npz",
             split=np.asarray([split]),
-            design_version=np.asarray(["0.6.0"]),
+            design_version=np.asarray(["0.6.1"]),
             ablation=np.asarray(["minute_daily_weekly"]),
+            symbol=np.asarray(["JM"]),
+            series_id=np.asarray(["8Y_DCE_JM2601"]),
             checkpoint_sha256=np.asarray(["wrong"]),
             source_sha256=np.asarray(["source"]),
         )

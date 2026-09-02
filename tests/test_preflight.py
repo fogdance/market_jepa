@@ -20,3 +20,5 @@ def test_preflight_has_required_anomalies_and_distributions(causal_data, causal_
             "partial_late",
         }
     assert len(report["source"]["sha256"]) == 64
+    assert report["source"]["symbol"] == "JM"
+    assert report["source"]["series_id"] == "8Y_DCE_JM2601"

@@ -1,6 +1,6 @@
 # Market-JEPA V0
 
-独立的多时间尺度 JEPA 研究实验，用于检验当前 causal market latent 是否包含可泛化的未来市场分布信息。冻结的研究协议见 [设计文档](docs/market_jepa_v0_design.md)，当前版本为 `0.6.0`，状态为 `Frozen — Approved for V0 implementation`。
+独立的多时间尺度 JEPA 研究实验，用于检验当前 causal market latent 是否包含可泛化的未来市场分布信息。冻结的研究协议见 [设计文档](docs/market_jepa_v0_design.md)，当前版本为 `0.6.1`，状态为 `Frozen — Approved for V0 implementation`。
 
 V0 不包含交易动作、持仓、PnL、强化学习或外部行情依赖。唯一行情源是仓库根目录的 `8Y_DCE_JM2601_1m.csv`。
 
@@ -32,6 +32,8 @@ CSV 必须保留字段：
 ```text
 Date,Open,High,Low,Close,Volume,OpenInterest
 ```
+
+导出 metadata 使用品种 `symbol=JM` 和来源序列 `series_id=8Y_DCE_JM2601`；不把该八年文件表述为真实单合约 JM2601。
 
 实现不会自动删除、修复或 winsorize 异常行情；preflight 只生成报告。
 

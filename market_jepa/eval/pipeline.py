@@ -165,12 +165,16 @@ def evaluate_exports(
     directory = Path(input_dir)
     splits = {name: _load(directory / f"{name}.npz") for name in ("train", "validation", "test")}
     for split_name, data in splits.items():
-        if str(data["split"][0]) != split_name:
-            raise ValueError(f"{split_name}.npz declares split={data['split'][0]}")
+        if set(data["split"].astype(str)) != {split_name}:
+            raise ValueError(f"{split_name}.npz contains a different split label")
         if str(data["design_version"][0]) != config["design_version"]:
             raise ValueError(f"{split_name}.npz design version differs from checkpoint")
         if str(data["ablation"][0]) != config["model"]["ablation"]:
             raise ValueError(f"{split_name}.npz ablation differs from checkpoint")
+        if set(data["symbol"].astype(str)) != {config["data"]["symbol"]}:
+            raise ValueError(f"{split_name}.npz symbol differs from checkpoint")
+        if set(data["series_id"].astype(str)) != {config["data"]["series_id"]}:
+            raise ValueError(f"{split_name}.npz series id differs from checkpoint")
         if expected_checkpoint_sha256 is not None and (
             "checkpoint_sha256" not in data
             or str(data["checkpoint_sha256"][0]) != expected_checkpoint_sha256

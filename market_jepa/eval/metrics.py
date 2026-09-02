@@ -15,16 +15,21 @@ def cosine_error(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
 
 def block_bootstrap(
     effects: np.ndarray, blocks: np.ndarray, samples: int, seed: int
-) -> dict[str, float]:
+) -> dict[str, float | int]:
     effects = np.asarray(effects, dtype=np.float64)
     blocks = np.asarray(blocks)
+    if effects.ndim != 1 or blocks.ndim != 1 or len(effects) != len(blocks):
+        raise ValueError("effects and blocks must be equal-length one-dimensional arrays")
+    if len(effects) == 0 or samples <= 0:
+        raise ValueError("block bootstrap requires observations and positive samples")
     unique, inverse = np.unique(blocks, return_inverse=True)
-    block_means = np.asarray([effects[inverse == index].mean() for index in range(len(unique))])
+    block_sums = np.bincount(inverse, weights=effects, minlength=len(unique))
+    block_counts = np.bincount(inverse, minlength=len(unique))
     rng = np.random.default_rng(seed)
-    draws = rng.integers(0, len(block_means), size=(samples, len(block_means)))
-    distribution = block_means[draws].mean(axis=1)
+    draws = rng.integers(0, len(unique), size=(samples, len(unique)))
+    distribution = block_sums[draws].sum(axis=1) / block_counts[draws].sum(axis=1)
     return {
-        "effect": float(block_means.mean()),
+        "effect": float(effects.mean()),
         "ci95_low": float(np.quantile(distribution, 0.025)),
         "ci95_high": float(np.quantile(distribution, 0.975)),
         "blocks": int(len(unique)),
@@ -40,7 +45,7 @@ def block_shuffle_indices(timestamp_ns: np.ndarray, seed: int) -> np.ndarray:
     sessions = hours >= 18
     result = np.arange(len(timestamps))
     rng = np.random.default_rng(seed)
-    for month in range(12):
+    for month in np.unique(months):
         for session in (False, True):
             group = np.flatnonzero((months == month) & (sessions == session))
             if len(group) > 1:

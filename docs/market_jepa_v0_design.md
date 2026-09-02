@@ -1,6 +1,6 @@
 # Market-JEPA V0 设计文档
 
-**文档版本：0.6.0**
+**文档版本：0.6.1**
 **状态：Frozen — Approved for V0 implementation**
 **最后更新：2026-09-02**
 
@@ -13,7 +13,8 @@
 | 0.3.0 | 2026-09-02 | 已替代 | minute CSV 成为唯一行情源；Daily/Weekly context 改为 completed history + anchor 时点实时 partial bar；冻结 partial 聚合、特征、normalization 与 source-index provenance contract；补充 8 项 partial snapshot 防泄漏测试。 |
 | 0.4.0 | 2026-09-02 | 已替代 | 增加 causal 时间 observation 与 source bar count；预注册实际 split 日期和 outcome 公式；增加 partial/completed 分布审计、训练前异常 preflight、分 horizon EMA target diagnostics；清除遗留项目引用。 |
 | 0.5.0 | 2026-09-02 | 已替代 | Future/Persistence EMA target 改为 market-only；时间/count 限定为 current-context-only；weekday 改为 5 日周期；模型删除 raw delta；公平 baseline 获得相同 observation；冻结完整训练与 checkpoint-selection protocol。 |
-| 0.6.0 | 2026-09-02 | Frozen — Approved for V0 implementation | Minute market 与时间 observation 改为两个独立 encoder；online/EMA Minute Market Transformer 输入语义完全同构；冻结最终 V0 架构。 |
+| 0.6.0 | 2026-09-02 | 已替代 | Minute market 与时间 observation 改为两个独立 encoder；online/EMA Minute Market Transformer 输入语义完全同构；冻结最终 V0 架构。 |
+| 0.6.1 | 2026-09-02 | Frozen — Approved for V0 implementation | 修正 trading-day block bootstrap 的逐样本 estimand 和 calendar-month shuffle；checkpoint 增加完整 RNG state；补充端到端集成测试；行情标识改为品种与来源序列两级 metadata。 |
 
 ## 1. 目标与边界
 
@@ -30,6 +31,7 @@
 
 - 仓库当前没有既有 Dataset 或交易日历。V0 明确以 minute CSV 为唯一权威行情源；Daily/Weekly 是按 anchor 实时生成的 causal snapshot，不依赖外部最终日/周线文件。
 - 输入文件为 `8Y_DCE_JM2601_1m.csv`，列为 `Date, Open, High, Low, Close, Volume, OpenInterest`。
+- 输出 metadata 固定使用 `symbol=JM`、`series_id=8Y_DCE_JM2601`，只标识品种和来源文件序列，不声称它是真实单合约 JM2601。
 - 文件有 655,099 条数据，范围为 2018-01-02 09:01:00 至 2025-12-02 15:00:00；时间严格递增，六个数值字段没有缺失值。
 - 数据同时包含 09:00--15:00 日盘和 21:00--23:00 夜盘，但没有显式 `trading_day`、上市日、到期日或交易所日历字段。
 
@@ -334,9 +336,9 @@ CLI 只允许在显式 `--smoke` profile 下限制 samples/epochs/model size。�
 
 ## 7. Checkpoint 与导出
 
-checkpoint 保存 online Minute Market Encoder、Minute Context Encoder、Daily/Weekly encoder、Fusion、EMA target Minute Market Encoder、三个 predictors、optimizer/scheduler/GradScaler、epoch/global step、完整配置、三个 timeframe normalization、feature definitions（含 minute 时间 observation 与 Daily/Weekly `source_bar_count`）、固定 split ranges、symbol、source SHA-256 和 preflight audit metadata。恢复时校验 source hash、feature 顺序、online/target market-encoder 同构性和 ablation mode。
+checkpoint 保存 online Minute Market Encoder、Minute Context Encoder、Daily/Weekly encoder、Fusion、EMA target Minute Market Encoder、三个 predictors、optimizer/scheduler/GradScaler、Python/NumPy/Torch CPU/Torch CUDA RNG state、epoch/global step、完整配置、三个 timeframe normalization、feature definitions（含 minute 时间 observation 与 Daily/Weekly `source_bar_count`）、固定 split ranges、symbol、series id、source SHA-256 和 preflight audit metadata。恢复时校验 source hash、feature 顺序、online/target market-encoder 同构性和 ablation mode，并在继续下一 epoch 前恢复全部 RNG state。
 
-latent 导出为 `.npz`，包含 timestamps、trading days、symbol、split、anchor indices、Daily/Weekly partial 的 source-index bounds、`Z_market`、每个 horizon 的 predictor/target/persistence latent、fair raw baseline features，以及 H16/H64/H256 的 return、MFE、MAE、realized volatility。evaluation 只消费导出文件，无需重新训练。
+latent 导出为 `.npz`，包含 timestamps、trading days、symbol、series id、split、anchor indices、Daily/Weekly partial 的 source-index bounds、`Z_market`、每个 horizon 的 predictor/target/persistence latent、fair raw baseline features，以及 H16/H64/H256 的 return、MFE、MAE、realized volatility。evaluation 只消费导出文件，无需重新训练。
 
 ## 8. Evaluation
 
@@ -364,7 +366,7 @@ latent 导出为 `.npz`，包含 timestamps、trading days、symbol、split、an
 2. kNN endpoint：query 的实际 future outcome 向量与 K=50 邻居 outcome 均值的误差，相对 random historical K=50 的改善；outcome 为 H64 return/MFE/MAE/realized-volatility 经 train scale 标准化后的四维向量；
 3. probe endpoint：H64 return 与 realized-volatility 的 train-target-variance-normalized MSE 平均值，`raw baseline - latent probe`。
 
-Validation 对 trading day 做 block bootstrap（固定 seed，10,000 次），每项改善的 95% percentile CI 下界必须大于 0。Test 不再选模型/alpha/lambda，三项 point estimate 必须与 Validation 同方向；考虑单年样本统计功效，Test CI 不强制显著。只有三项都满足才标记 GO，否则标记 NO-GO/INCONCLUSIVE，并完整报告 effect size 和 CI。H16/H256、K=20/100、shuffle/train-mean control 是预注册 secondary endpoints，不替代失败的 H64 主 endpoint。
+Validation 对 trading day 做 block bootstrap（固定 seed，10,000 次），但 point estimate 始终是全部逐样本 effect 的算术平均。每次 bootstrap 有放回抽取 trading-day block；抽中某天时带入该日全部 sample，并用所有抽中 block 的 `sum(effect) / count(sample)` 得到一次统计量，不能先对每日均值再等权平均。每项改善的 95% percentile CI 下界必须大于 0。Test 不再选模型/alpha/lambda，三项 point estimate 必须与 Validation 同方向；考虑单年样本统计功效，Test CI 不强制显著。只有三项都满足才标记 GO，否则标记 NO-GO/INCONCLUSIVE，并完整报告 effect size 和 CI。H16/H256、K=20/100、shuffle/train-mean control 是预注册 secondary endpoints，不替代失败的 H64 主 endpoint。
 
 ## 9. 验证计划
 

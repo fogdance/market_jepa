@@ -1,9 +1,10 @@
 experiment_id: market_jepa_v0_minute_daily
-design_version: 0.6.0
+design_version: 0.6.1
 
 data:
   csv_path: 8Y_DCE_JM2601_1m.csv
-  symbol: JM2601
+  symbol: JM
+  series_id: 8Y_DCE_JM2601
   minute_context_length: 512
   horizons: [16, 64, 256]
   realized_vol_window: 32
