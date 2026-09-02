@@ -74,3 +74,23 @@ def test_ema_updates_only_from_isomorphic_market_encoder() -> None:
         online_parameter.add_(2.0)
     model.update_target(0.75)
     assert torch.allclose(target_parameter, before + 0.5)
+
+
+def test_inference_mode_matches_no_grad_outputs_exactly() -> None:
+    model = small_model().eval()
+    batch = fake_batch()
+    with torch.no_grad():
+        expected = model(batch)
+    with torch.inference_mode():
+        actual = model(batch)
+    torch.testing.assert_close(actual["z_market"], expected["z_market"], rtol=0, atol=0)
+    for horizon in model.horizons:
+        torch.testing.assert_close(
+            actual["predictions"][horizon],
+            expected["predictions"][horizon],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            actual["targets"][horizon], expected["targets"][horizon], rtol=0, atol=0
+        )

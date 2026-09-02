@@ -87,7 +87,13 @@ def _model(config: dict) -> MarketJEPA:
     )
 
 
-def _trainer(config: dict, data, model: MarketJEPA, preflight: dict) -> Trainer:
+def _trainer(
+    config: dict,
+    data,
+    model: MarketJEPA,
+    preflight: dict,
+    runtime_options: dict | None = None,
+) -> Trainer:
     return Trainer(
         model,
         config,
@@ -96,6 +102,7 @@ def _trainer(config: dict, data, model: MarketJEPA, preflight: dict) -> Trainer:
         source_sha256="synthetic-source",
         preflight_metadata=preflight,
         device=torch.device("cpu"),
+        runtime_options=runtime_options,
     )
 
 
@@ -167,3 +174,41 @@ def test_train_resume_export_eval_chain_is_deterministic(tmp_path: Path) -> None
     assert evaluation["design_version"] == "0.6.1"
     assert evaluation["go_no_go"]["primary_horizon"] == 2
     assert set(evaluation["ranges"]) == {"train", "validation", "test"}
+
+
+def test_multiworker_runtime_preserves_resume_trajectory(tmp_path: Path) -> None:
+    csv_path = tmp_path / "synthetic.csv"
+    _write_synthetic_csv(csv_path)
+    continuous_config = _integration_config(csv_path, tmp_path / "continuous_workers")
+    resumed_config = _integration_config(csv_path, tmp_path / "resumed_workers")
+    data = prepare_market_data(continuous_config)
+    runtime = {
+        "num_workers": 2,
+        "persistent_workers": True,
+        "prefetch_factor": 2,
+    }
+
+    configure_determinism(42)
+    continuous = _trainer(
+        continuous_config, data, _model(continuous_config), {}, runtime
+    )
+    continuous_history = continuous.fit()
+
+    configure_determinism(42)
+    interrupted = _trainer(
+        resumed_config, data, _model(resumed_config), {}, runtime
+    )
+    interrupted.fit(stop_before_epoch=1)
+    checkpoint = load_checkpoint(
+        Path(resumed_config["training"]["checkpoint_dir"])
+        / resumed_config["experiment_id"]
+        / "last.pt"
+    )
+    configure_determinism(42)
+    resumed = _trainer(resumed_config, data, _model(resumed_config), {}, runtime)
+    resumed.resume(checkpoint)
+    resumed_history = resumed.fit()
+
+    assert resumed_history == continuous_history
+    for name, continuous_value in continuous.model.state_dict().items():
+        assert torch.equal(continuous_value, resumed.model.state_dict()[name]), name

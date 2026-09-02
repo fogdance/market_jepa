@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,11 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--cuda-smoke", action="store_true")
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--runtime-config",
+        default="artifacts/performance/selected_runtime.json",
+        help="implementation-only DataLoader settings produced by benchmark_market_jepa.py",
+    )
     args = parser.parse_args()
     if args.smoke and args.cuda_smoke:
         parser.error("choose only one smoke profile")
@@ -51,6 +57,11 @@ def main() -> None:
         train = _limit(train, max(maximum, config["training"]["batch_size"]))
         validation = _limit(validation, maximum)
     model = MarketJEPA(len(MARKET_FEATURES), len(CONTEXT_FEATURES), config["data"]["horizons"], config["model"])
+    runtime_options = None
+    runtime_path = Path(args.runtime_config)
+    if not (args.smoke or args.cuda_smoke) and runtime_path.is_file():
+        runtime_options = json.loads(runtime_path.read_text(encoding="utf-8"))
+        print(f"runtime_config={runtime_path} options={runtime_options}")
     trainer = Trainer(
         model,
         config,
@@ -59,6 +70,7 @@ def main() -> None:
         source_sha256=file_sha256(config["data"]["csv_path"]),
         preflight_metadata={"json": str(json_path), "csv": str(csv_path), "source": report["source"]},
         device=torch.device("cuda" if torch.cuda.is_available() and not args.smoke else "cpu"),
+        runtime_options=runtime_options,
     )
     if args.resume:
         trainer.resume(load_checkpoint(args.resume))

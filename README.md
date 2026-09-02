@@ -57,13 +57,25 @@ uv run python train_market_jepa.py --smoke
 uv run python train_market_jepa.py --cuda-smoke
 ```
 
+正式模型的性能基准会比较 `num_workers=0/2/4`、校验候选批次逐字节一致，
+并把选中的纯运行时 DataLoader 参数写入
+`artifacts/performance/selected_runtime.json`：
+
+```bash
+uv run python benchmark_market_jepa.py \
+  --output artifacts/performance/optimized.json
+```
+
+正式训练会自动读取该运行时文件；它不改变冻结的数据、模型、batch 或优化器协议。
+
 只有 CUDA smoke 完整执行 forward、AMP backward、optimizer、scheduler、EMA 且无 deterministic 错误后，才允许启动冻结的 50-epoch V0：
 
 ```bash
 uv run python train_market_jepa.py
 ```
 
-恢复训练必须使用同一数据文件；程序会校验 source SHA-256、配置和 normalizer：
+恢复训练必须使用同一数据文件和运行时参数；程序会校验 source SHA-256、配置、
+normalizer、Python 源码 manifest、依赖锁文件及全部 RNG state：
 
 ```bash
 uv run python train_market_jepa.py --resume artifacts/checkpoints/market_jepa_v0_default/last.pt
