@@ -6,4 +6,6 @@ __pycache__/
 .coverage
 artifacts/
 outputs/
+/*.tar.bz2
+/*.tar.bz2.sha256
 8Y_DCE_JM2601_1m.csv

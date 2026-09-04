@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -59,6 +59,31 @@ class MarketData:
     daily_position: np.ndarray
     weekly_position: np.ndarray
     normalizers: NormalizerBundle
+    _combined_token_cache: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = field(
+        default=None, init=False, repr=False
+    )
+
+    def combined_token_arrays(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return lazily shared Daily/Weekly market+context token tables."""
+
+        if self._combined_token_cache is None:
+            self._combined_token_cache = (
+                np.concatenate(
+                    [self.daily_completed_market, self.daily_completed_context], axis=1
+                ),
+                np.concatenate(
+                    [self.daily_partial_market, self.daily_partial_context], axis=1
+                ),
+                np.concatenate(
+                    [self.weekly_completed_market, self.weekly_completed_context], axis=1
+                ),
+                np.concatenate(
+                    [self.weekly_partial_market, self.weekly_partial_context], axis=1
+                ),
+            )
+        return self._combined_token_cache
 
     def daily_snapshot(self, anchor: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         position = int(self.daily_position[anchor])
@@ -142,8 +167,10 @@ def _fit_normalizers(
     weekly_partial_market: np.ndarray,
     weekly_completed: pd.DataFrame,
     weekly_completed_market: np.ndarray,
+    fit_range: tuple[str, str] | None = None,
 ) -> NormalizerBundle:
-    start, end = map(pd.Timestamp, config["data"]["splits"]["train"])
+    selected_range = config["data"]["splits"]["train"] if fit_range is None else fit_range
+    start, end = map(pd.Timestamp, selected_range)
     minute_mask = minute["trading_day"].between(start, end).to_numpy()
     daily_complete_mask = daily_completed["trading_day"].between(start, end).to_numpy()
     weekly_complete_mask = weekly_completed["trading_day"].between(start, end).to_numpy()
@@ -179,9 +206,17 @@ def _fit_normalizers(
 
 
 def prepare_market_data(
-    config: dict[str, Any], normalizers: NormalizerBundle | None = None
+    config: dict[str, Any],
+    normalizers: NormalizerBundle | None = None,
+    *,
+    normalizer_fit_range: tuple[str, str] | None = None,
+    max_trading_day: str | pd.Timestamp | None = None,
 ) -> MarketData:
-    minute = load_minute_csv(config["data"]["csv_path"])
+    if normalizers is not None and normalizer_fit_range is not None:
+        raise ValueError("cannot fit and supply normalizers at the same time")
+    minute = load_minute_csv(
+        config["data"]["csv_path"], max_trading_day=max_trading_day
+    )
     window = int(config["data"]["realized_vol_window"])
     daily_partial = causal_partial_bars(minute, "trading_day")
     weekly_partial = causal_partial_bars(minute, "iso_key")
@@ -224,6 +259,7 @@ def prepare_market_data(
             raw_arrays["weekly_partial_market"],
             weekly_completed,
             raw_arrays["weekly_completed_market"],
+            fit_range=normalizer_fit_range,
         )
 
     daily_position = np.searchsorted(

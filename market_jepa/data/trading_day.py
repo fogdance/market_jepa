@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import numpy as np
@@ -49,8 +50,43 @@ def _canonicalize(frame: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def load_minute_csv(path: str | Path) -> pd.DataFrame:
-    frame = _canonicalize(pd.read_csv(path))
+def _rows_through_trading_day(path: str | Path, cutoff: pd.Timestamp) -> int:
+    """Count the source prefix without materializing post-cutoff rows."""
+
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError("CSV has no header")
+        timestamp_columns = [
+            name
+            for name in reader.fieldnames
+            if name.strip().lower() in {"date", "datetime", "timestamp"}
+        ]
+        if len(timestamp_columns) != 1:
+            raise ValueError("CSV must contain exactly one timestamp column")
+        timestamp_column = timestamp_columns[0]
+        rows = 0
+        for row in reader:
+            timestamp = pd.Timestamp(row[timestamp_column])
+            calendar_day = timestamp.normalize()
+            # `infer_trading_day` assigns a night row to the next observed
+            # daytime date. Consequently, night rows stamped on the cutoff
+            # calendar day necessarily belong after the cutoff and are not
+            # materialized. Earlier Friday/holiday-eve nights remain included.
+            if calendar_day > cutoff or (
+                calendar_day == cutoff and timestamp.hour >= 18
+            ):
+                break
+            rows += 1
+    return rows
+
+
+def load_minute_csv(
+    path: str | Path, max_trading_day: str | pd.Timestamp | None = None
+) -> pd.DataFrame:
+    cutoff = pd.Timestamp(max_trading_day) if max_trading_day is not None else None
+    nrows = _rows_through_trading_day(path, cutoff) if cutoff is not None else None
+    frame = _canonicalize(pd.read_csv(path, nrows=nrows))
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="raise")
     for column in RAW_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="raise")
@@ -72,6 +108,10 @@ def load_minute_csv(path: str | Path) -> pd.DataFrame:
         raise ValueError(f"invalid OHLC rows: {int(invalid.sum())}")
     frame["trading_day"] = infer_trading_day(frame["timestamp"])
     frame = frame.loc[frame["trading_day"].notna()].copy().reset_index(drop=True)
+    if cutoff is not None:
+        frame = frame.loc[frame["trading_day"] <= cutoff].copy().reset_index(drop=True)
+        if frame.empty:
+            raise ValueError("max_trading_day removes every minute row")
     frame["source_index"] = np.arange(len(frame), dtype=np.int64)
     iso = frame["trading_day"].dt.isocalendar()
     frame["iso_key"] = iso["year"].astype(np.int64) * 100 + iso["week"].astype(np.int64)

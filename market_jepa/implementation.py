@@ -9,6 +9,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINTS = (
     "train_market_jepa.py",
+    "train_predictive_state_v0_7.py",
     "export_market_latents.py",
     "eval_market_jepa.py",
     "benchmark_market_jepa.py",

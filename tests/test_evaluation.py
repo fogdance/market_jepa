@@ -6,7 +6,9 @@ import pytest
 from market_jepa.config import DEFAULT_CONFIG
 from market_jepa.eval.metrics import block_bootstrap, block_shuffle_indices, nearest_indices
 from market_jepa.eval import pipeline
+from market_jepa.eval import predictive_geometry
 from market_jepa.eval.pipeline import _future_report, evaluate_exports, evaluate_validation_exports
+from market_jepa.eval.predictive_geometry import evaluate_predictive_geometry
 from market_jepa.eval.raw_baseline import raw_baseline_features, raw_feature_names
 
 
@@ -140,6 +142,8 @@ def _write_validation_export(path, split: str, samples: int, start: str) -> None
         z_market=rng.normal(size=(samples, 4)),
         z_target_h64=target,
         z_prediction_h64=target + rng.normal(scale=0.1, size=target.shape),
+        z_prediction_h16=target + rng.normal(scale=0.2, size=target.shape),
+        z_prediction_h256=target + rng.normal(scale=0.3, size=target.shape),
         z_persistence_h64=target + rng.normal(scale=0.3, size=target.shape),
         outcomes_h64=rng.normal(size=(samples, 4)),
         raw_features=rng.normal(size=(samples, 6)),
@@ -172,3 +176,41 @@ def test_validation_evaluation_never_loads_test(tmp_path, monkeypatch) -> None:
     assert report["knn"]["k"] == 50
     assert report["prediction"]["horizon"] == 64
     assert report["probe"]["targets"] == ["return", "realized_volatility"]
+
+
+def test_predictive_geometry_uses_only_train_and_validation(tmp_path, monkeypatch) -> None:
+    _write_validation_export(tmp_path / "train.npz", "train", 60, "2022-01-03T09:00")
+    _write_validation_export(
+        tmp_path / "validation.npz", "validation", 8, "2023-01-03T09:00"
+    )
+    validation = evaluate_validation_exports(
+        tmp_path,
+        DEFAULT_CONFIG,
+        expected_checkpoint_sha256="checkpoint",
+        expected_source_sha256="source",
+    )
+    loaded_names = []
+    original_load = predictive_geometry._load
+
+    def recording_load(path, names=None):
+        loaded_names.append(path.name)
+        return original_load(path, names)
+
+    monkeypatch.setattr(predictive_geometry, "_load", recording_load)
+    report = evaluate_predictive_geometry(
+        tmp_path,
+        DEFAULT_CONFIG,
+        validation["knn"],
+        expected_checkpoint_sha256="checkpoint",
+        expected_source_sha256="source",
+    )
+    assert loaded_names == ["train.npz", "validation.npz"]
+    assert report["z_market_knn"] == validation["knn"]
+    assert report["p64_knn"]["random_error"] == pytest.approx(
+        validation["knn"]["random_error"], abs=1e-12
+    )
+    assert report["multi_horizon_predictive_state_knn"]["random_error"] == pytest.approx(
+        validation["knn"]["random_error"], abs=1e-12
+    )
+    assert report["formal_v0_decision"] == "VALIDATION_NO_GO"
+    assert report["test_consumed"] is False

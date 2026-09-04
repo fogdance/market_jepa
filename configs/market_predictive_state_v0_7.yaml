@@ -1,0 +1,72 @@
+experiment_id: market_predictive_state_v0_7
+protocol_version: 0.7.1
+protocol_path: docs/market_predictive_state_v0_7_end_to_end_protocol.md
+
+data:
+  csv_path: 8Y_DCE_JM2601_1m.csv
+  symbol: JM
+  series_id: 8Y_DCE_JM2601
+  minute_context_length: 512
+  horizons: [16, 64, 256]
+  realized_vol_window: 32
+  anchor_stride: 1
+  populations:
+    inner_fit: ['2018-01-02', '2021-12-31']
+    inner_dev: ['2022-01-01', '2022-12-31']
+    final_train: ['2018-01-02', '2022-12-31']
+    development: ['2023-01-01', '2024-12-31']
+    final_test: ['2025-01-01', '2025-12-02']
+
+model:
+  ablation: minute_daily_weekly
+  minute_d_model: 256
+  minute_layers: 4
+  minute_heads: 8
+  minute_ffn_dim: 1024
+  time_hidden: 32
+  daily_hidden: 128
+  weekly_hidden: 128
+  recurrent_layers: 2
+  fusion_hidden: 512
+  latent_dim: 256
+  predictor_hidden: 512
+  dropout: 0.1
+  state_hidden: 512
+  state_dim: 3072
+
+training:
+  seed: 42
+  microbatch_size: 64
+  gradient_accumulation: 2
+  max_epochs: 100
+  gradient_clip_norm: 1.0
+  amp: true
+  warmup_ratio: 0.05
+  scheduler: cosine
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  encoder_learning_rate: 0.0003
+  encoder_weight_decay: 0.05
+  head_learning_rate: 0.001
+  head_weight_decay: 0.0001
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+
+target:
+  pair_samples: 100000
+  pair_seed: 4242
+  rff_seed: 4243
+  rff_per_bandwidth: 1024
+  bandwidth_multipliers: [0.5, 1.0, 2.0]
+
+evaluation:
+  k: 50
+  random_seed: 4244
+  bootstrap_samples: 10000
+  bootstrap_seed: 42
+  bootstrap_block: iso_trading_week
+
+artifacts:
+  checkpoint_dir: artifacts/checkpoints/market_predictive_state_v0_7
+  evaluation_dir: artifacts/evaluation/market_predictive_state_v0_7
