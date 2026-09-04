@@ -208,10 +208,26 @@ class PredictiveStateRun:
         self.fixed_rff = FixedRFF(target.rff).to(device).eval()
         self.start_epoch = 0
         self.global_step = 0
+        self.skipped_optimizer_steps = 0
         self.best_epoch = -1
         self.best_dev_loss = math.inf
         self.history: list[dict[str, Any]] = []
         self.last_path = output_dir / "last.pt"
+
+    def _finish_optimizer_step(self) -> bool:
+        """Apply an AMP optimizer step and advance the schedule only on success."""
+        scale_before = float(self.scaler.get_scale())
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        scale_after = float(self.scaler.get_scale())
+        step_succeeded = not self.amp_enabled or scale_after >= scale_before
+        self.optimizer.zero_grad(set_to_none=True)
+        if step_succeeded:
+            self.scheduler.step()
+            self.global_step += 1
+        else:
+            self.skipped_optimizer_steps += 1
+        return step_succeeded
 
     def _epoch(self, loader: DataLoader, training: bool) -> float:
         self.model.train(training)
@@ -242,11 +258,7 @@ class PredictiveStateRun:
                 if (batch_index + 1) % self.accumulation == 0:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.parameters, float(self.training["gradient_clip_norm"]))
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.scheduler.step()
-                    self.global_step += 1
+                    self._finish_optimizer_step()
             total += float(per_sample.detach().sum().item())
             count += len(per_sample)
         return total / count
@@ -270,6 +282,7 @@ class PredictiveStateRun:
             "epochs_to_run": self.epochs_to_run,
             "scheduler_horizon_epochs": self.scheduler_horizon_epochs,
             "global_step": self.global_step,
+            "skipped_optimizer_steps": self.skipped_optimizer_steps,
             "best_epoch": self.best_epoch,
             "best_dev_loss": self.best_dev_loss,
             "budget_hit_ceiling": self.best_epoch == 99 if self.stage == "inner" else None,
@@ -333,6 +346,7 @@ class PredictiveStateRun:
         self.scaler.load_state_dict(checkpoint["scaler"])
         self.start_epoch = int(checkpoint["epoch"]) + 1
         self.global_step = int(checkpoint["global_step"])
+        self.skipped_optimizer_steps = int(checkpoint["skipped_optimizer_steps"])
         self.best_epoch = int(checkpoint["best_epoch"])
         self.best_dev_loss = float(checkpoint["best_dev_loss"])
         self.history = list(checkpoint["history"])
@@ -349,6 +363,7 @@ class PredictiveStateRun:
         try:
             for epoch in range(self.start_epoch, self.epochs_to_run):
                 started = time.perf_counter()
+                skipped_before = self.skipped_optimizer_steps
                 self.sampler.set_epoch(epoch)
                 train_loss = self._epoch(self.train_loader, training=True)
                 dev_loss = self._epoch(self.dev_loader, training=False) if self.dev_loader is not None else None
@@ -359,6 +374,8 @@ class PredictiveStateRun:
                     "epoch": epoch,
                     "train_state_mse": train_loss,
                     "inner_dev_state_mse": dev_loss,
+                    "skipped_optimizer_steps": self.skipped_optimizer_steps - skipped_before,
+                    "skipped_optimizer_steps_total": self.skipped_optimizer_steps,
                     "elapsed_seconds": time.perf_counter() - started,
                 }
                 self.history.append(record)
@@ -383,6 +400,7 @@ class PredictiveStateRun:
             "budget_hit_ceiling": selected_epoch == 99 if self.stage == "inner" else False,
             "best_dev_loss": self.best_dev_loss if self.stage == "inner" else None,
             "epochs_completed": len(self.history),
+            "skipped_optimizer_steps": self.skipped_optimizer_steps,
             "elapsed_seconds_this_process": time.perf_counter() - started_run,
             "checkpoint": str(self.last_path),
             "test_consumed": False,

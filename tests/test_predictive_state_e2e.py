@@ -437,3 +437,57 @@ def test_predictive_state_run_resume_matches_continuous_training(
     assert state_dict_sha256(resumed.model.state_dict()) == continuous_hash
     checkpoint = load_checkpoint(resumed.last_path)
     assert checkpoint["sampler_epoch"] == checkpoint["epoch"] == 1
+
+
+def test_amp_overflow_does_not_advance_scheduler_or_global_step() -> None:
+    from market_jepa.train.predictive_state_trainer import PredictiveStateRun
+
+    class FakeScaler:
+        def __init__(self) -> None:
+            self.scale = 65536.0
+            self.next_scale = 32768.0
+
+        def get_scale(self) -> float:
+            return self.scale
+
+        def step(self, optimizer) -> None:
+            del optimizer
+
+        def update(self) -> None:
+            self.scale = self.next_scale
+
+    class FakeOptimizer:
+        def __init__(self) -> None:
+            self.zero_grad_calls = 0
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            assert set_to_none is True
+            self.zero_grad_calls += 1
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.steps = 0
+
+        def step(self) -> None:
+            self.steps += 1
+
+    run = PredictiveStateRun.__new__(PredictiveStateRun)
+    run.scaler = FakeScaler()
+    run.optimizer = FakeOptimizer()
+    run.scheduler = FakeScheduler()
+    run.amp_enabled = True
+    run.global_step = 0
+    run.skipped_optimizer_steps = 0
+
+    assert run._finish_optimizer_step() is False
+    assert run.global_step == 0
+    assert run.scheduler.steps == 0
+    assert run.skipped_optimizer_steps == 1
+    assert run.optimizer.zero_grad_calls == 1
+
+    run.scaler.next_scale = run.scaler.scale
+    assert run._finish_optimizer_step() is True
+    assert run.global_step == 1
+    assert run.scheduler.steps == 1
+    assert run.skipped_optimizer_steps == 1
+    assert run.optimizer.zero_grad_calls == 2
