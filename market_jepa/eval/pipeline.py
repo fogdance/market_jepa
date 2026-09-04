@@ -19,9 +19,13 @@ from .metrics import (
 OUTCOME_NAMES = ("return", "mfe", "mae", "realized_volatility")
 
 
-def _load(path: Path) -> dict[str, np.ndarray]:
+def _load(path: Path, names: set[str] | None = None) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as loaded:
-        return {name: loaded[name] for name in loaded.files}
+        selected = loaded.files if names is None else names
+        missing = set(selected).difference(loaded.files)
+        if missing:
+            raise ValueError(f"{path.name} is missing arrays: {sorted(missing)}")
+        return {name: loaded[name] for name in selected}
 
 
 def _date_range(data: dict[str, np.ndarray]) -> dict[str, str | int]:
@@ -71,6 +75,7 @@ def _knn_report(
     neighbor_order: np.ndarray,
     bootstrap_samples: int,
     seed: int,
+    bootstrap_seed: int | None = None,
 ) -> dict[str, Any]:
     train_outcome = train[f"outcomes_h{horizon}"].astype(np.float64)
     query_outcome = data[f"outcomes_h{horizon}"].astype(np.float64)
@@ -105,7 +110,7 @@ def _knn_report(
                 random_error - nearest_error,
                 data["trading_day_ns"],
                 bootstrap_samples,
-                seed + k,
+                seed + k if bootstrap_seed is None else bootstrap_seed,
             ),
             "outcome_distributions": summaries,
             "paired_effects": random_error - nearest_error,
@@ -141,6 +146,8 @@ def _probe_report(
             "return": float(raw_error_by_target[0]),
             "realized_volatility": float(raw_error_by_target[1]),
         },
+        "latent_normalized_mse": float(latent_row.mean()),
+        "raw_normalized_mse": float(raw_row.mean()),
         "normalized_mse_improvement": block_bootstrap(
             raw_row - latent_row, data["trading_day_ns"], bootstrap_samples, seed
         ),
@@ -156,6 +163,181 @@ def _strip_arrays(value: Any) -> Any:
     return value
 
 
+def _validate_export(
+    split_name: str,
+    data: dict[str, np.ndarray],
+    config: dict[str, Any],
+    expected_checkpoint_sha256: str | None,
+    expected_source_sha256: str | None,
+) -> None:
+    if set(data["split"].astype(str)) != {split_name}:
+        raise ValueError(f"{split_name}.npz contains a different split label")
+    if str(data["design_version"][0]) != config["design_version"]:
+        raise ValueError(f"{split_name}.npz design version differs from checkpoint")
+    if str(data["ablation"][0]) != config["model"]["ablation"]:
+        raise ValueError(f"{split_name}.npz ablation differs from checkpoint")
+    if set(data["symbol"].astype(str)) != {config["data"]["symbol"]}:
+        raise ValueError(f"{split_name}.npz symbol differs from checkpoint")
+    if set(data["series_id"].astype(str)) != {config["data"]["series_id"]}:
+        raise ValueError(f"{split_name}.npz series id differs from checkpoint")
+    if expected_checkpoint_sha256 is not None and (
+        "checkpoint_sha256" not in data
+        or str(data["checkpoint_sha256"][0]) != expected_checkpoint_sha256
+    ):
+        raise ValueError(f"{split_name}.npz checkpoint hash differs")
+    if expected_source_sha256 is not None and (
+        "source_sha256" not in data
+        or str(data["source_sha256"][0]) != expected_source_sha256
+    ):
+        raise ValueError(f"{split_name}.npz source hash differs")
+
+
+def evaluate_validation_exports(
+    input_dir: str | Path,
+    config: dict[str, Any],
+    expected_checkpoint_sha256: str | None = None,
+    expected_source_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Run only the three frozen H64 Validation gates; never load Test."""
+
+    directory = Path(input_dir)
+    metadata = {
+        "split",
+        "design_version",
+        "ablation",
+        "symbol",
+        "series_id",
+        "checkpoint_sha256",
+        "source_sha256",
+        "timestamp_ns",
+        "trading_day_ns",
+    }
+    train = _load(
+        directory / "train.npz",
+        metadata | {"z_market", "outcomes_h64", "raw_features"},
+    )
+    validation = _load(
+        directory / "validation.npz",
+        metadata
+        | {
+            "z_market",
+            "z_target_h64",
+            "z_prediction_h64",
+            "z_persistence_h64",
+            "outcomes_h64",
+            "raw_features",
+        },
+    )
+    for split_name, data in (("train", train), ("validation", validation)):
+        _validate_export(
+            split_name,
+            data,
+            config,
+            expected_checkpoint_sha256,
+            expected_source_sha256,
+        )
+
+    horizon = 64
+    k = 50
+    bootstrap_samples = int(config["evaluation"]["bootstrap_samples"])
+    seed = int(config["evaluation"]["seed"])
+    if horizon not in config["data"]["horizons"]:
+        raise ValueError("Validation protocol requires H64")
+    if k not in config["evaluation"]["ks"]:
+        raise ValueError("Validation protocol requires K=50")
+    if float(config["evaluation"]["ridge_alpha"]) != 1.0:
+        raise ValueError("Validation protocol requires Ridge alpha=1.0")
+    if bootstrap_samples != 10_000 or seed != 42:
+        raise ValueError("Validation protocol requires 10000 bootstraps with seed 42")
+
+    target = validation[f"z_target_h{horizon}"]
+    learned_error = cosine_error(validation[f"z_prediction_h{horizon}"], target)
+    persistence_error = cosine_error(validation[f"z_persistence_h{horizon}"], target)
+    prediction_bootstrap = block_bootstrap(
+        persistence_error - learned_error,
+        validation["trading_day_ns"],
+        bootstrap_samples,
+        seed,
+    )
+
+    neighbor_order = nearest_indices(
+        train["z_market"],
+        validation["z_market"],
+        train["timestamp_ns"],
+        validation["timestamp_ns"],
+        k,
+    )
+    knn = _knn_report(
+        train,
+        validation,
+        horizon,
+        [k],
+        neighbor_order,
+        bootstrap_samples,
+        seed,
+        bootstrap_seed=seed,
+    )[str(k)]
+    probe = _probe_report(
+        train,
+        validation,
+        horizon,
+        float(config["evaluation"]["ridge_alpha"]),
+        bootstrap_samples,
+        seed,
+    )
+
+    prediction_pass = prediction_bootstrap["ci95_low"] > 0
+    knn_pass = knn["improvement"]["ci95_low"] > 0
+    probe_pass = probe["normalized_mse_improvement"]["ci95_low"] > 0
+    return _strip_arrays(
+        {
+            "design_version": "0.6.2",
+            "training_design_version": str(train["design_version"][0]),
+            "test_consumed": False,
+            "ranges": {
+                "train": _date_range(train),
+                "validation": _date_range(validation),
+            },
+            "prediction": {
+                "horizon": horizon,
+                "jepa_error": float(learned_error.mean()),
+                "persistence_error": float(persistence_error.mean()),
+                "effect": prediction_bootstrap["effect"],
+                "ci95": [
+                    prediction_bootstrap["ci95_low"],
+                    prediction_bootstrap["ci95_high"],
+                ],
+                "pass": prediction_pass,
+            },
+            "knn": {
+                "horizon": horizon,
+                "k": k,
+                "latent_error": knn["nearest_outcome_mse"],
+                "random_error": knn["random_outcome_mse"],
+                "effect": knn["improvement"]["effect"],
+                "ci95": [
+                    knn["improvement"]["ci95_low"],
+                    knn["improvement"]["ci95_high"],
+                ],
+                "pass": knn_pass,
+            },
+            "probe": {
+                "horizon": horizon,
+                "targets": ["return", "realized_volatility"],
+                "latent_mse": probe["latent_normalized_mse"],
+                "raw_mse": probe["raw_normalized_mse"],
+                "effect": probe["normalized_mse_improvement"]["effect"],
+                "ci95": [
+                    probe["normalized_mse_improvement"]["ci95_low"],
+                    probe["normalized_mse_improvement"]["ci95_high"],
+                ],
+                "pass": probe_pass,
+            },
+            "validation_go": prediction_pass and knn_pass and probe_pass,
+        }
+    )
+
+
 def evaluate_exports(
     input_dir: str | Path,
     config: dict[str, Any],
@@ -165,26 +347,13 @@ def evaluate_exports(
     directory = Path(input_dir)
     splits = {name: _load(directory / f"{name}.npz") for name in ("train", "validation", "test")}
     for split_name, data in splits.items():
-        if set(data["split"].astype(str)) != {split_name}:
-            raise ValueError(f"{split_name}.npz contains a different split label")
-        if str(data["design_version"][0]) != config["design_version"]:
-            raise ValueError(f"{split_name}.npz design version differs from checkpoint")
-        if str(data["ablation"][0]) != config["model"]["ablation"]:
-            raise ValueError(f"{split_name}.npz ablation differs from checkpoint")
-        if set(data["symbol"].astype(str)) != {config["data"]["symbol"]}:
-            raise ValueError(f"{split_name}.npz symbol differs from checkpoint")
-        if set(data["series_id"].astype(str)) != {config["data"]["series_id"]}:
-            raise ValueError(f"{split_name}.npz series id differs from checkpoint")
-        if expected_checkpoint_sha256 is not None and (
-            "checkpoint_sha256" not in data
-            or str(data["checkpoint_sha256"][0]) != expected_checkpoint_sha256
-        ):
-            raise ValueError(f"{split_name}.npz checkpoint hash differs")
-        if expected_source_sha256 is not None and (
-            "source_sha256" not in data
-            or str(data["source_sha256"][0]) != expected_source_sha256
-        ):
-            raise ValueError(f"{split_name}.npz source hash differs")
+        _validate_export(
+            split_name,
+            data,
+            config,
+            expected_checkpoint_sha256,
+            expected_source_sha256,
+        )
     train = splits["train"]
     horizons = sorted(
         int(name.removeprefix("outcomes_h")) for name in train if name.startswith("outcomes_h")

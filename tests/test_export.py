@@ -5,7 +5,7 @@ from copy import deepcopy
 import numpy as np
 import torch
 
-from export_market_latents import export_split
+from export_market_latents import VALIDATION_EXPORT_SPLITS, export_split
 from market_jepa.data import CONTEXT_FEATURES, MARKET_FEATURES, MarketDataset
 from market_jepa.model import MarketJEPA
 
@@ -31,6 +31,9 @@ def test_export_preserves_timestamp_provenance_and_hashes(
     model = MarketJEPA(
         len(MARKET_FEATURES), len(CONTEXT_FEATURES), causal_config["data"]["horizons"], model_config
     )
+    original_parameters = {
+        name: parameter.detach().clone() for name, parameter in model.named_parameters()
+    }
     dataset = MarketDataset(causal_data, causal_config, "train", indices=np.asarray([4]))
     path = export_split(
         model,
@@ -49,3 +52,9 @@ def test_export_preserves_timestamp_provenance_and_hashes(
         assert exported["symbol"][0] == "JM"
         assert exported["series_id"][0] == "8Y_DCE_JM2601"
         assert exported["z_target_h1"].shape == (1, 16)
+    for name, parameter in model.named_parameters():
+        assert torch.equal(parameter, original_parameters[name]), name
+
+
+def test_validation_export_surface_excludes_test() -> None:
+    assert VALIDATION_EXPORT_SPLITS == ("train", "validation")

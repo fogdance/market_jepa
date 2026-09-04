@@ -15,6 +15,9 @@ from market_jepa.train import load_checkpoint
 from market_jepa.train.checkpoint import sha256
 
 
+VALIDATION_EXPORT_SPLITS = ("train", "validation")
+
+
 def _move(value, device):
     if isinstance(value, torch.Tensor):
         return value.to(device)
@@ -91,7 +94,12 @@ def export_split(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--split", choices=["train", "validation", "test", "all"], default="all")
+    parser.add_argument(
+        "--split",
+        choices=VALIDATION_EXPORT_SPLITS,
+        required=True,
+        help="V0.6.2 is Validation-only; Test export is intentionally unavailable.",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     args = parser.parse_args()
@@ -108,7 +116,7 @@ def main() -> None:
     device = torch.device(args.device)
     model.to(device)
     output_dir = Path(args.output_dir or f'artifacts/latents/{config["experiment_id"]}')
-    splits = ["train", "validation", "test"] if args.split == "all" else [args.split]
+    splits = [args.split]
     provenance = {
         "checkpoint_sha256": sha256(args.checkpoint),
         "source_sha256": checkpoint["source_sha256"],

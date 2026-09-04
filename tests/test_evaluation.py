@@ -5,7 +5,8 @@ import pytest
 
 from market_jepa.config import DEFAULT_CONFIG
 from market_jepa.eval.metrics import block_bootstrap, block_shuffle_indices, nearest_indices
-from market_jepa.eval.pipeline import _future_report, evaluate_exports
+from market_jepa.eval import pipeline
+from market_jepa.eval.pipeline import _future_report, evaluate_exports, evaluate_validation_exports
 from market_jepa.eval.raw_baseline import raw_baseline_features, raw_feature_names
 
 
@@ -116,3 +117,58 @@ def test_evaluation_rejects_latents_from_another_checkpoint(tmp_path) -> None:
             expected_checkpoint_sha256="expected",
             expected_source_sha256="source",
         )
+
+
+def _write_validation_export(path, split: str, samples: int, start: str) -> None:
+    rng = np.random.default_rng(42 if split == "train" else 43)
+    timestamps = np.arange(
+        np.datetime64(start, "m").astype(np.int64),
+        np.datetime64(start, "m").astype(np.int64) + samples,
+    ).astype("datetime64[m]").astype("datetime64[ns]").astype(np.int64)
+    target = rng.normal(size=(samples, 4))
+    np.savez_compressed(
+        path,
+        split=np.asarray([split] * samples),
+        design_version=np.asarray(["0.6.1"]),
+        ablation=np.asarray(["minute_daily_weekly"]),
+        symbol=np.asarray(["JM"] * samples),
+        series_id=np.asarray(["8Y_DCE_JM2601"] * samples),
+        checkpoint_sha256=np.asarray(["checkpoint"]),
+        source_sha256=np.asarray(["source"]),
+        timestamp_ns=timestamps,
+        trading_day_ns=timestamps.astype("datetime64[ns]").astype("datetime64[D]").astype(np.int64),
+        z_market=rng.normal(size=(samples, 4)),
+        z_target_h64=target,
+        z_prediction_h64=target + rng.normal(scale=0.1, size=target.shape),
+        z_persistence_h64=target + rng.normal(scale=0.3, size=target.shape),
+        outcomes_h64=rng.normal(size=(samples, 4)),
+        raw_features=rng.normal(size=(samples, 6)),
+    )
+
+
+def test_validation_evaluation_never_loads_test(tmp_path, monkeypatch) -> None:
+    _write_validation_export(tmp_path / "train.npz", "train", 60, "2022-01-03T09:00")
+    _write_validation_export(
+        tmp_path / "validation.npz", "validation", 8, "2023-01-03T09:00"
+    )
+    loaded_names = []
+    original_load = pipeline._load
+
+    def recording_load(path, names=None):
+        loaded_names.append(path.name)
+        return original_load(path, names)
+
+    monkeypatch.setattr(pipeline, "_load", recording_load)
+    report = evaluate_validation_exports(
+        tmp_path,
+        DEFAULT_CONFIG,
+        expected_checkpoint_sha256="checkpoint",
+        expected_source_sha256="source",
+    )
+    assert loaded_names == ["train.npz", "validation.npz"]
+    assert "test" not in report["ranges"]
+    assert report["test_consumed"] is False
+    assert set(report) >= {"prediction", "knn", "probe", "validation_go"}
+    assert report["knn"]["k"] == 50
+    assert report["prediction"]["horizon"] == 64
+    assert report["probe"]["targets"] == ["return", "realized_volatility"]
