@@ -1,0 +1,55 @@
+experiment_id: v0_8_frozen_jepa_cdf
+protocol_version: 0.8.0
+
+checkpoint:
+  path: artifacts/checkpoints/market_jepa_v0_default/last.pt
+  required_epoch: 49
+  required_design_version: 0.6.1
+  required_source_sha256: d6887df95e0a8f0b165e87b190d3af438ceb23445702c35f191e5d546c03a688
+
+data:
+  latent_export_dir: artifacts/latents/market_jepa_v0_6_2
+  cache_dir: artifacts/cache/v0_epoch49_cdf
+  max_trading_day: '2024-12-31'
+  populations:
+    inner_fit: ['2018-01-02', '2021-12-31']
+    inner_dev: ['2022-01-01', '2022-12-31']
+    final_train: ['2018-01-02', '2022-12-31']
+    development: ['2023-01-01', '2024-12-31']
+    final_test: ['2025-01-01', '2025-12-02']
+
+cdf:
+  quantiles: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  quantile_method: linear
+  outcomes: [Return, MFE, MAE, RV]
+  horizons: [16, 64, 256]
+  state_dim: 108
+
+model:
+  latent_dim: 256
+  head_hidden: 256
+  context_hidden: 128
+
+training:
+  seed: 42
+  optimizer: AdamW
+  learning_rate: 0.001
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0001
+  batch_size: 1024
+  max_epochs: 50
+  gradient_clip_norm: 1.0
+  scheduler: none
+  amp: false
+
+evaluation:
+  bootstrap_block: iso_trading_week
+  bootstrap_samples: 10000
+  bootstrap_seed: 42
+  cache_consistency_samples: 128
+  cache_consistency_seed: 4511
+  cache_max_abs_error: 1.0e-6
+
+artifacts:
+  output_dir: artifacts/evaluation/v0_8_frozen_jepa_cdf
