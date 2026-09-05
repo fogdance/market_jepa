@@ -212,3 +212,88 @@ def test_multiworker_runtime_preserves_resume_trajectory(tmp_path: Path) -> None
     assert resumed_history == continuous_history
     for name, continuous_value in continuous.model.state_dict().items():
         assert torch.equal(continuous_value, resumed.model.state_dict()[name]), name
+
+
+def test_fixed_budget_mode_never_evaluates_validation_or_writes_best(tmp_path: Path) -> None:
+    csv_path = tmp_path / "synthetic.csv"
+    _write_synthetic_csv(csv_path)
+    config = _integration_config(csv_path, tmp_path / "fixed_budget")
+    data = prepare_market_data(config)
+    trainer = Trainer(
+        _model(config),
+        config,
+        MarketDataset(data, config, "train"),
+        MarketDataset(data, config, "validation"),
+        source_sha256="synthetic-source",
+        preflight_metadata={},
+        device=torch.device("cpu"),
+        checkpoint_selection="fixed_budget_final",
+        evaluate_validation_during_training=False,
+    )
+    history = trainer.fit()
+    checkpoint_dir = Path(config["training"]["checkpoint_dir"]) / config["experiment_id"]
+    assert len(history) == 2
+    assert all(record["validation"] is None for record in history)
+    assert not (checkpoint_dir / "best.pt").exists()
+    checkpoint = load_checkpoint(checkpoint_dir / "last.pt")
+    assert checkpoint["epoch"] == 1
+    assert checkpoint["checkpoint_selection"] == "fixed_budget_final"
+    assert checkpoint["evaluate_validation_during_training"] is False
+
+
+def test_jepa_amp_overflow_does_not_advance_scheduler_ema_or_global_step() -> None:
+    class FakeScaler:
+        def __init__(self) -> None:
+            self.scale = 65_536.0
+            self.next_scale = 32_768.0
+
+        def get_scale(self) -> float:
+            return self.scale
+
+        def step(self, optimizer) -> None:
+            del optimizer
+
+        def update(self) -> None:
+            self.scale = self.next_scale
+
+    class FakeOptimizer:
+        def __init__(self) -> None:
+            self.zero_grad_calls = 0
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            assert set_to_none is True
+            self.zero_grad_calls += 1
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.steps = 0
+
+        def step(self) -> None:
+            self.steps += 1
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.ema_updates = 0
+
+        def update_target(self, tau: float) -> None:
+            assert tau == 0.996
+            self.ema_updates += 1
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.scaler = FakeScaler()
+    trainer.optimizer = FakeOptimizer()
+    trainer.scheduler = FakeScheduler()
+    trainer.model = FakeModel()
+    trainer.config = {"training": {"ema_tau": 0.996}}
+    trainer.amp_enabled = True
+    trainer.global_step = 0
+    trainer.skipped_optimizer_steps = 0
+
+    assert trainer._finish_optimizer_step() is False
+    assert trainer.global_step == trainer.scheduler.steps == trainer.model.ema_updates == 0
+    assert trainer.skipped_optimizer_steps == 1
+
+    trainer.scaler.next_scale = trainer.scaler.scale
+    assert trainer._finish_optimizer_step() is True
+    assert trainer.global_step == trainer.scheduler.steps == trainer.model.ema_updates == 1
+    assert trainer.skipped_optimizer_steps == 1

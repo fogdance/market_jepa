@@ -102,6 +102,9 @@ class Trainer:
         preflight_metadata: dict[str, Any],
         device: torch.device,
         runtime_options: dict[str, Any] | None = None,
+        *,
+        checkpoint_selection: str = "validation_h64",
+        evaluate_validation_during_training: bool = True,
     ) -> None:
         self.model = model.to(device)
         self.config = config
@@ -110,6 +113,12 @@ class Trainer:
         self.source_sha256 = source_sha256
         self.preflight_metadata = preflight_metadata
         self.device = device
+        if checkpoint_selection not in {"validation_h64", "fixed_budget_final"}:
+            raise ValueError(f"unknown checkpoint selection rule: {checkpoint_selection}")
+        if checkpoint_selection == "validation_h64" and not evaluate_validation_during_training:
+            raise ValueError("validation checkpoint selection requires validation evaluation")
+        self.checkpoint_selection = checkpoint_selection
+        self.evaluate_validation_during_training = bool(evaluate_validation_during_training)
         self.implementation_manifest = implementation_manifest()
         self.implementation_sha256 = manifest_sha256(self.implementation_manifest)
         training = config["training"]
@@ -202,6 +211,7 @@ class Trainer:
         self.global_step = 0
         self.best_error = math.inf
         self.best_epoch = -1
+        self.skipped_optimizer_steps = 0
         self.resume_history: list[dict[str, Any]] = []
         self.checkpoint_dir = Path(training["checkpoint_dir"]) / config["experiment_id"]
 
@@ -214,6 +224,10 @@ class Trainer:
             raise ValueError("cannot resume: normalization statistics changed")
         if checkpoint.get("runtime_options") != self.runtime_options:
             raise ValueError("cannot resume exactly: runtime options changed")
+        if checkpoint.get("checkpoint_selection", "validation_h64") != self.checkpoint_selection:
+            raise ValueError("cannot resume exactly: checkpoint selection rule changed")
+        if checkpoint.get("evaluate_validation_during_training", True) != self.evaluate_validation_during_training:
+            raise ValueError("cannot resume exactly: validation timing changed")
         if "loader_rng_state" not in checkpoint:
             raise ValueError("cannot resume exactly: checkpoint has no DataLoader RNG state")
         if "rng_state" not in checkpoint:
@@ -233,6 +247,7 @@ class Trainer:
         self.global_step = int(checkpoint["global_step"])
         self.best_error = float(checkpoint["best_error"])
         self.best_epoch = int(checkpoint["best_epoch"])
+        self.skipped_optimizer_steps = int(checkpoint.get("skipped_optimizer_steps", 0))
         self.resume_history = list(checkpoint.get("history", []))
         if len(self.resume_history) != self.start_epoch:
             raise ValueError("cannot resume exactly: checkpoint history does not match epoch")
@@ -241,6 +256,22 @@ class Trainer:
         self.validation_loader_generator.set_state(
             checkpoint["loader_rng_state"]["validation"]
         )
+
+    def _finish_optimizer_step(self) -> bool:
+        """Advance optimizer-dependent state only when AMP applies the update."""
+        scale_before = float(self.scaler.get_scale())
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        scale_after = float(self.scaler.get_scale())
+        step_succeeded = not self.amp_enabled or scale_after >= scale_before
+        self.optimizer.zero_grad(set_to_none=True)
+        if step_succeeded:
+            self.scheduler.step()
+            self.model.update_target(self.config["training"]["ema_tau"])
+            self.global_step += 1
+        else:
+            self.skipped_optimizer_steps += 1
+        return step_succeeded
 
     def _epoch(self, loader: DataLoader, training: bool) -> dict[str, float]:
         self.model.train(training)
@@ -273,12 +304,7 @@ class Trainer:
                         list(self.model.optimizer_parameters()),
                         self.config["training"]["gradient_clip_norm"],
                     )
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.scheduler.step()
-                    self.model.update_target(self.config["training"]["ema_tau"])
-                    self.global_step += 1
+                    self._finish_optimizer_step()
             batch_size = batch["minute_market"].shape[0]
             averages.update(metrics, batch_size)
             latent.update(output["z_market"])
@@ -316,6 +342,9 @@ class Trainer:
             "global_step": self.global_step,
             "best_error": self.best_error,
             "best_epoch": self.best_epoch,
+            "skipped_optimizer_steps": self.skipped_optimizer_steps,
+            "checkpoint_selection": self.checkpoint_selection,
+            "evaluate_validation_during_training": self.evaluate_validation_during_training,
             "normalizers": self.train_dataset.data.normalizers.to_dict(),
             "source_sha256": self.source_sha256,
             "preflight": self.preflight_metadata,
@@ -359,20 +388,28 @@ class Trainer:
         try:
             for epoch in range(self.start_epoch, final_epoch):
                 self.sampler.set_epoch(epoch)
+                skipped_before = self.skipped_optimizer_steps
                 train_metrics = self._epoch(self.train_loader, training=True)
-                validation_metrics = self._epoch(self.validation_loader, training=False)
+                validation_metrics = (
+                    self._epoch(self.validation_loader, training=False)
+                    if self.evaluate_validation_during_training
+                    else None
+                )
                 record = {
                     "epoch": epoch,
                     "train": train_metrics,
                     "validation": validation_metrics,
+                    "skipped_optimizer_steps": self.skipped_optimizer_steps - skipped_before,
+                    "skipped_optimizer_steps_total": self.skipped_optimizer_steps,
                 }
-                selection = validation_metrics[
-                    f"prediction_loss_h{selection_horizon}"
-                ]
-                is_best = selection < self.best_error
-                if is_best:
-                    self.best_error = selection
-                    self.best_epoch = epoch
+                is_best = False
+                if self.checkpoint_selection == "validation_h64":
+                    assert validation_metrics is not None
+                    selection = validation_metrics[f"prediction_loss_h{selection_horizon}"]
+                    is_best = selection < self.best_error
+                    if is_best:
+                        self.best_error = selection
+                        self.best_epoch = epoch
                 history.append(record)
                 state = self._checkpoint_state(epoch, record, history)
                 save_checkpoint(state, self.checkpoint_dir / "last.pt")
