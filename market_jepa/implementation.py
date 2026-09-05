@@ -13,6 +13,8 @@ ENTRYPOINTS = (
     "export_market_latents.py",
     "eval_market_jepa.py",
     "benchmark_market_jepa.py",
+    "train_market_jepa_last_year_holdout.py",
+    "v0_jepa_price_oi_volume_audit.py",
     "pyproject.toml",
     "uv.lock",
 )
