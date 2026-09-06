@@ -1,0 +1,67 @@
+design_version: "1.0"
+experiment_id: market_jepa_v1_development
+data:
+  csv_path: 8Y_DCE_JM2601_1m.csv
+  symbol: JM
+  series_id: 8Y_DCE_JM2601
+  minute_context_length: 512
+  horizons: [16, 64, 256]
+  realized_vol_window: 32
+  anchor_stride: 1
+  splits:
+    train: ['2018-01-02', '2022-12-31']
+    validation: ['2023-01-01', '2024-12-31']
+    test: ['2025-01-01', '2025-12-02']
+model:
+  minute_market_dim: 14
+  minute_context_dim: 5
+  daily_market_dim: 14
+  daily_context_dim: 1
+  weekly_market_dim: 14
+  weekly_context_dim: 1
+  d_model: 256
+  num_heads: 8
+  ffn_dim: 1024
+  minute_layers: 4
+  minute_max_length: 512
+  daily_gru_layers: 2
+  daily_gru_hidden: 128
+  weekly_gru_layers: 2
+  weekly_gru_hidden: 128
+  num_state_tokens: 8
+  cross_scale_rounds: 2
+  belief_dim: 256
+  predictor_hidden: 512
+  dropout: 0.1
+  use_commodity_embedding: false
+training:
+  seed: 42
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  batch_size: 64
+  gradient_accumulation: 2
+  max_epochs: 50
+  warmup_ratio: 0.05
+  scheduler: cosine
+  gradient_clip_norm: 1.0
+  ema_tau: 0.996
+  amp: true
+  lambda_var: 0.0
+  lambda_cov: 0.0
+  variance_floor: 1.0
+  collapse_threshold: 0.05
+  num_workers: 0
+  checkpoint_dir: artifacts/checkpoints
+evaluation:
+  ks: [20, 50, 100]
+  ridge_alpha: 1.0
+  bootstrap_samples: 10000
+  seed: 42
+  output_dir: artifacts/evaluation
+development:
+  optimizer_steps: 100
+  batch_size: 2
+  train_days: 30
