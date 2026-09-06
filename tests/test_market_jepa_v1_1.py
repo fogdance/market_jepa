@@ -13,7 +13,7 @@ from market_jepa.model import jepa_loss
 from market_jepa_v1_1 import DEFAULT_V11_CONFIG, MarketJEPAV11
 from market_jepa_v1_1.config import (
     DAILY_CONTEXT_FEATURES, IMC_FEATURES, MINUTE_CONTEXT_FEATURES,
-    TRAIN_COMMODITIES, WEEKLY_CONTEXT_FEATURES,
+    TRAIN_COMMODITIES, WEEKLY_CONTEXT_FEATURES, validate_v11_config,
 )
 from market_jepa_v1_1.dataset import (
     BAR_COLUMNS, V11ContractDataset, V11DataStore, collate_v11_batch,
@@ -139,9 +139,23 @@ def _dataset_config() -> dict:
     value = deepcopy(DEFAULT_V11_CONFIG)
     value["data"].update(
         minute_capacity=16, daily_capacity=8, current_weekly_capacity=4,
-        history_weekly_capacity=8, anchor_stride=17,
+        anchor_stride=17,
     )
+    value["history_week"].update(capacity=8, require_full_history=False)
     return value
+
+
+def _prepend_reliable_week(store: V11DataStore, starts: dict[str, str]) -> V11DataStore:
+    for commodity, date in starts.items():
+        frame = store.frames[commodity]["weekly"]
+        contract = str(store.episode_table.loc[store.episode_table.commodity == commodity, "contract_uid"].iloc[0])
+        row = pd.DataFrame([{
+            "commodity": commodity, "contract_uid": contract, "week_end_date": pd.Timestamp(date),
+            "open": 90.0, "high": 92.0, "low": 89.0, "close": 91.0,
+            "volume": 1000.0, "open_interest": 800.0,
+        }])
+        store.frames[commodity]["weekly"] = pd.concat((row, frame), ignore_index=True)
+    return store
 
 
 @pytest.fixture(scope="module")
@@ -341,7 +355,7 @@ def test_v11_history_truncation_boundary_uses_episode_id():
     frames = original.frames
     for frame in frames["FG"].values():
         frame["contract_uid"] = "FG_REENTRY"
-    config = _dataset_config(); config["data"]["history_weekly_capacity"] = 4
+    config = _dataset_config(); config["history_week"]["capacity"] = 4
     dataset = V11ContractDataset(V11DataStore(episodes, frames), config)
     current = next(arrays for arrays in dataset.episode_arrays if arrays.episode.episode_id == 2)
     market, _, mask, _, boundary = dataset._history(current.episode)
@@ -623,6 +637,58 @@ def test_v11_sampler_determinism():
     assert list(first) != list(second)
 
 
+def test_v11_contract_filtered_if_history_shorter_than_config():
+    store = _prepend_reliable_week(_make_store(), {"FG": "2019-03-01"})
+    config = _dataset_config(); config["history_week"].update(years=3, require_full_history=True)
+    dataset = V11ContractDataset(store, config)
+    assert [arrays.episode.episode_id for arrays in dataset.episode_arrays] == [1, 2]
+    summary = dataset.history_week_eligibility_summary["FG"]
+    assert summary["total_contract_count"] == 3
+    assert summary["filtered_insufficient_history_count"] == 1
+    assert summary["eligible_contract_count"] == 2
+
+
+def test_v11_history_years_is_configurable():
+    formal_two_years = deepcopy(DEFAULT_V11_CONFIG)
+    formal_two_years["history_week"]["years"] = 2
+    validate_v11_config(formal_two_years)
+    store = _prepend_reliable_week(_make_store(), {"FG": "2019-03-01"})
+    two_years = _dataset_config(); two_years["history_week"].update(years=2, require_full_history=True)
+    three_years = _dataset_config(); three_years["history_week"].update(years=3, require_full_history=True)
+    assert V11ContractDataset(store, two_years).history_week_eligibility_summary["FG"]["eligible_contract_count"] == 3
+    assert V11ContractDataset(store, three_years).history_week_eligibility_summary["FG"]["eligible_contract_count"] == 2
+
+
+def test_v11_late_listed_commodity_uses_own_history_start():
+    store = _prepend_reliable_week(
+        _make_store(("FG", "SH")), {"FG": "2018-01-05", "SH": "2021-01-08"},
+    )
+    config = _dataset_config(); config["history_week"].update(years=3, require_full_history=True)
+    dataset = V11ContractDataset(store, config)
+    assert dataset.history_week_eligibility_summary["FG"]["eligible_contract_count"] == 3
+    assert dataset.history_week_eligibility_summary["SH"]["eligible_contract_count"] == 0
+    assert dataset.history_week_eligibility_summary["SH"]["reason"] == "insufficient history_week coverage"
+
+
+def test_v11_sampler_never_selects_ineligible_contract():
+    store = _prepend_reliable_week(
+        _make_store(TRAIN_COMMODITIES), {commodity: "2019-03-01" for commodity in TRAIN_COMMODITIES},
+    )
+    config = _dataset_config(); config["history_week"].update(years=3, require_full_history=True)
+    dataset = V11ContractDataset(store, config)
+    sampler = HierarchicalCommodityContractSampler(dataset, 10_000, seed=29)
+    for index in sampler:
+        episode_index = np.searchsorted(dataset.offsets, index, side="right") - 1
+        assert dataset.episode_arrays[episode_index].episode.episode_id in (1, 2)
+
+
+def test_v11_no_short_history_silent_fallback():
+    store = _prepend_reliable_week(_make_store(("SH",)), {"SH": "2021-01-08"})
+    config = _dataset_config(); config["history_week"].update(years=3, require_full_history=True)
+    with pytest.raises(ValueError, match="insufficient history_week coverage"):
+        V11ContractDataset(store, config)
+
+
 def test_v11_collate_keeps_metadata_outside_model(contract_dataset):
     batch = collate_v11_batch([contract_dataset[0], contract_dataset[1]])
     assert isinstance(batch["metadata"], list)
@@ -635,9 +701,16 @@ class _TrainerDataset(torch.utils.data.Dataset):
         self.daily_truncation_count = 0
         self.daily_truncated_tokens = 0
         self.episode_arrays = [
-            SimpleNamespace(episode=SimpleNamespace(commodity=commodity), anchors=np.arange(1))
-            for commodity in TRAIN_COMMODITIES
+            SimpleNamespace(
+                episode=SimpleNamespace(commodity=commodity, key=(commodity, f"X{index}", 0)),
+                anchors=np.arange(1),
+            )
+            for index, commodity in enumerate(TRAIN_COMMODITIES)
         ]
+        self.eligible_contracts_by_commodity = {
+            commodity: ((commodity, f"X{index}", 0),)
+            for index, commodity in enumerate(TRAIN_COMMODITIES)
+        }
 
     @property
     def hierarchy(self):

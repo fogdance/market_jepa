@@ -7,10 +7,12 @@ data:
   minute_capacity: 512
   daily_capacity: 256
   current_weekly_capacity: 64
-  history_weekly_capacity: 156
-  history_years: 3
   horizons: [16, 64, 256]
   anchor_stride: 1
+history_week:
+  years: 3
+  capacity: 156
+  require_full_history: true
 model:
   minute_market_dim: 9
   minute_context_dim: 5

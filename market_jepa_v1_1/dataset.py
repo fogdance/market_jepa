@@ -180,6 +180,80 @@ def _read_lifecycle_references(
     return {key: (value[1], value[2]) for key, value in best.items()}
 
 
+def reliable_weekly_bounds(frame: pd.DataFrame) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    """Return the bounds of weekly rows that satisfy the formal market validity gate."""
+    if frame.empty:
+        return None, None
+    time_column = "week_end_date" if "week_end_date" in frame else "period_end"
+    prices = frame.loc[:, ["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
+    volume = pd.to_numeric(frame["volume"], errors="coerce")
+    oi = pd.to_numeric(frame["open_interest"], errors="coerce")
+    reliable = (
+        np.isfinite(prices).all(axis=1) & (prices > 0).all(axis=1)
+        & np.isfinite(volume) & (volume >= 0)
+        & np.isfinite(oi) & (oi > 0)
+        & (prices["high"] >= prices.max(axis=1))
+        & (prices["low"] <= prices.min(axis=1))
+    )
+    timestamps = pd.to_datetime(frame.loc[reliable, time_column], errors="raise")
+    return (None, None) if timestamps.empty else (pd.Timestamp(timestamps.min()), pd.Timestamp(timestamps.max()))
+
+
+def compute_history_week_eligibility(
+    episodes: pd.DataFrame,
+    weekly_bounds: dict[str, tuple[pd.Timestamp | None, pd.Timestamp | None]],
+    *,
+    years: int,
+    require_full_history: bool,
+    role: str,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Precompute calendar-coverage eligibility before any anchor is sampled."""
+    table = episodes.loc[episodes.role == role].copy()
+    table["main_start_date"] = pd.to_datetime(table["main_start_date"], errors="raise")
+    records: list[dict[str, Any]] = []
+    summaries: dict[str, dict[str, Any]] = {}
+    commodities = sorted(set(table.commodity.astype(str)) | set(weekly_bounds))
+    for commodity in commodities:
+        first, last = weekly_bounds.get(commodity, (None, None))
+        commodity_records = []
+        for row in table.loc[table.commodity == commodity].sort_values("main_start_date").itertuples(index=False):
+            main_start = pd.Timestamp(row.main_start_date)
+            available_years = 0.0 if first is None else max(0.0, (main_start - first).days / 365.2425)
+            coverage = first is not None and main_start >= first + pd.DateOffset(years=years)
+            eligible = bool(coverage or not require_full_history)
+            reason = "" if eligible else (
+                "no_reliable_history_week" if first is None else "insufficient_history_week_coverage"
+            )
+            record = {
+                "commodity": commodity, "contract_uid": str(row.contract_uid),
+                "episode_id": int(row.episode_id), "main_start": main_start.date().isoformat(),
+                "first_weekly_date": None if first is None else first.date().isoformat(),
+                "last_weekly_date": None if last is None else last.date().isoformat(),
+                "available_history_years": round(available_years, 6),
+                "eligible": eligible, "filter_reason": reason,
+            }
+            records.append(record); commodity_records.append(record)
+        eligible_records = [record for record in commodity_records if record["eligible"]]
+        earliest = eligible_records[0] if eligible_records else None
+        if eligible_records:
+            summary_reason = ""
+        elif commodity_records:
+            summary_reason = "insufficient history_week coverage"
+        else:
+            summary_reason = f"no {role} contract episodes"
+        summaries[commodity] = {
+            "first_weekly_date": None if first is None else first.date().isoformat(),
+            "last_weekly_date": None if last is None else last.date().isoformat(),
+            "total_contract_count": len(commodity_records),
+            "filtered_insufficient_history_count": len(commodity_records) - len(eligible_records),
+            "eligible_contract_count": len(eligible_records),
+            "earliest_eligible_contract": None if earliest is None else earliest["contract_uid"],
+            "earliest_eligible_main_start": None if earliest is None else earliest["main_start"],
+            "reason": summary_reason,
+        }
+    return records, summaries
+
+
 class V11DataStore:
     def __init__(
         self, episodes: pd.DataFrame, frames: dict[str, dict[str, pd.DataFrame]],
@@ -278,8 +352,31 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
         self.minute_capacity = int(config["data"]["minute_capacity"])
         self.daily_capacity = int(config["data"]["daily_capacity"])
         self.current_weekly_capacity = int(config["data"]["current_weekly_capacity"])
-        self.history_weekly_capacity = int(config["data"]["history_weekly_capacity"])
-        self.history_years = int(config["data"]["history_years"])
+        history_config = config["history_week"]
+        self.history_weekly_capacity = int(history_config["capacity"])
+        self.history_years = int(history_config["years"])
+        self.require_full_history = bool(history_config["require_full_history"])
+        bounds = {
+            commodity: reliable_weekly_bounds(scales["weekly"])
+            for commodity, scales in store.frames.items()
+        }
+        self.history_week_eligibility_records, self.history_week_eligibility_summary = compute_history_week_eligibility(
+            store.episode_table, bounds, years=self.history_years,
+            require_full_history=self.require_full_history, role=role,
+        )
+        eligible_keys = {
+            (record["commodity"], record["contract_uid"], record["episode_id"])
+            for record in self.history_week_eligibility_records if record["eligible"]
+        }
+        self._history_week_eligibility_by_key = {
+            (record["commodity"], record["contract_uid"], record["episode_id"]): record
+            for record in self.history_week_eligibility_records
+        }
+        self.eligible_contracts_by_commodity = {
+            commodity: tuple(sorted(key for key in eligible_keys if key[0] == commodity))
+            for commodity in sorted(self.history_week_eligibility_summary)
+        }
+        self._eligible_contract_keys = eligible_keys
         self.episode_arrays: list[EpisodeArrays] = []
         self.offsets = [0]
         self.daily_truncation_count = 0
@@ -305,6 +402,14 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
         rows = self.store.episode_table.loc[self.store.episode_table.role == self.role]
         for row in rows.sort_values(["commodity", "main_start_date"]).itertuples(index=False):
             episode = self.store.episodes[(str(row.commodity), str(row.contract_uid), int(row.episode_id))]
+            if episode.key not in self._eligible_contract_keys:
+                eligibility = self._history_week_eligibility_by_key[episode.key]
+                self.excluded_episodes.append({
+                    "commodity": episode.commodity, "contract_uid": episode.contract_uid,
+                    "episode_id": str(episode.episode_id),
+                    "reason": eligibility["filter_reason"],
+                })
+                continue
             scales = self.store.frames.get(episode.commodity)
             if scales is None:
                 continue
@@ -348,7 +453,12 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
             self.episode_arrays.append(arrays)
             self.offsets.append(self.offsets[-1] + len(positions))
         if not self.episode_arrays:
-            raise ValueError(f"no valid {self.role} real-contract episodes")
+            insufficient = [
+                commodity for commodity, summary in self.history_week_eligibility_summary.items()
+                if summary["eligible_contract_count"] == 0
+            ]
+            detail = f"; insufficient history_week coverage: {insufficient}" if insufficient else ""
+            raise ValueError(f"no valid {self.role} real-contract episodes{detail}")
 
     def __len__(self) -> int:
         return self.offsets[-1]

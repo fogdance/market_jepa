@@ -45,10 +45,13 @@ DEFAULT_V11_CONFIG: dict[str, Any] = {
         "minute_capacity": 512,
         "daily_capacity": 256,
         "current_weekly_capacity": 64,
-        "history_weekly_capacity": 156,
-        "history_years": 3,
         "horizons": [16, 64, 256],
         "anchor_stride": 1,
+    },
+    "history_week": {
+        "years": 3,
+        "capacity": 156,
+        "require_full_history": True,
     },
     "model": {
         "minute_market_dim": len(IMC_FEATURES),
@@ -119,16 +122,26 @@ def validate_v11_config(config: dict[str, Any]) -> None:
         raise ValueError("V1.1 held-out commodity must be RB")
     fixed = {
         "minute_capacity": 512, "daily_capacity": 256,
-        "current_weekly_capacity": 64, "history_weekly_capacity": 156,
-        "history_years": 3, "horizons": [16, 64, 256],
+        "current_weekly_capacity": 64, "horizons": [16, 64, 256],
     }
     for name, value in fixed.items():
         if data[name] != value:
             raise ValueError(f"V1.1 freezes data.{name}={value}")
     if any(data[name] != config["model"][name] for name in (
-        "minute_capacity", "daily_capacity", "current_weekly_capacity", "history_weekly_capacity"
+        "minute_capacity", "daily_capacity", "current_weekly_capacity"
     )):
         raise ValueError("data/model capacities differ")
+    history = config.get("history_week")
+    if not isinstance(history, dict) or set(history) != {"years", "capacity", "require_full_history"}:
+        raise ValueError("history_week requires years/capacity/require_full_history")
+    if isinstance(history["years"], bool) or not isinstance(history["years"], int) or history["years"] <= 0:
+        raise ValueError("history_week.years must be a positive integer")
+    if history["capacity"] != 156 or history["capacity"] != config["model"]["history_weekly_capacity"]:
+        raise ValueError("V1.1 freezes history_week.capacity=156")
+    if not isinstance(history["require_full_history"], bool):
+        raise ValueError("history_week.require_full_history must be boolean")
+    if config.get("profile") != "debug" and history["require_full_history"] is not True:
+        raise ValueError("formal V1.1 requires the configured full historical coverage")
     training = config["training"]
     for name in ("optimizer", "learning_rate", "weight_decay", "betas", "eps", "ema_tau",
                  "lambda_var", "lambda_cov", "variance_floor", "gradient_clip_norm",

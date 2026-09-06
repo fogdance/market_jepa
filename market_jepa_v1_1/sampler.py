@@ -23,6 +23,10 @@ class HierarchicalCommodityContractSampler(Sampler[int]):
         self.episodes = {commodity: tuple(hierarchy[commodity]) for commodity in self.commodities}
         if any(not values for values in self.episodes.values()):
             raise ValueError("every train commodity requires a valid episode")
+        for commodity, episode_indices in self.episodes.items():
+            eligible = set(dataset.eligible_contracts_by_commodity[commodity])
+            if any(dataset.episode_arrays[index].episode.key not in eligible for index in episode_indices):
+                raise ValueError("sampler hierarchy contains a history-ineligible contract")
 
     def __len__(self) -> int:
         return self.num_samples

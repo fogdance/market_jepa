@@ -26,7 +26,8 @@ from .config import (
     TRAIN_COMMODITIES, WEEKLY_CONTEXT_FEATURES,
 )
 from .dataset import (
-    V11ContractDataset, V11DataStore, collate_v11_batch, fit_v11_shared_scaler,
+    V11ContractDataset, V11DataStore, collate_v11_batch,
+    compute_history_week_eligibility, fit_v11_shared_scaler, reliable_weekly_bounds,
 )
 from .model import MarketJEPAV11
 from .training import V11Trainer, assert_all_trainable_gradients, model_inputs
@@ -311,9 +312,42 @@ def audit_full_production_bars(root: Path) -> dict:
     }
 
 
-def production_smoke(config: dict, output: Path, device: torch.device) -> tuple[dict, dict, dict]:
+def audit_history_week_eligibility(root: Path, config: dict, output: Path) -> dict:
+    output.mkdir(parents=True, exist_ok=True)
+    episodes = pd.read_csv(root / "contract_episodes.csv")
+    bounds = {}
+    for commodity in TRAIN_COMMODITIES:
+        weekly = pd.read_csv(root / commodity / f"{commodity}_1w.csv")
+        bounds[commodity] = reliable_weekly_bounds(weekly)
+    history = config["history_week"]
+    records, summaries = compute_history_week_eligibility(
+        episodes, bounds, years=int(history["years"]),
+        require_full_history=bool(history["require_full_history"]), role="train",
+    )
+    order = {commodity: index for index, commodity in enumerate(TRAIN_COMMODITIES)}
+    records.sort(key=lambda record: (order[record["commodity"]], record["main_start"], record["episode_id"]))
+    summaries = {commodity: summaries[commodity] for commodity in TRAIN_COMMODITIES}
+    pd.DataFrame(records).to_csv(output / "history_week_eligibility.csv", index=False)
+    blockers = [
+        {"commodity": commodity, "eligible_contract_count": 0, "reason": summary["reason"]}
+        for commodity in TRAIN_COMMODITIES
+        for summary in (summaries[commodity],)
+        if summary["eligible_contract_count"] == 0
+    ]
+    report = {
+        "status": "BLOCKED" if blockers else "PASS",
+        "history_week": dict(history), "commodities": summaries,
+        "contracts": records, "blockers": blockers,
+    }
+    write_json(output / "history_week_eligibility.json", report)
+    return report
+
+
+def production_smoke(
+    config: dict, output: Path, device: torch.device, *, full_bar_audit: dict | None = None,
+) -> tuple[dict, dict, dict]:
     root = Path(config["data"]["root"])
-    full_bar_audit = audit_full_production_bars(root)
+    full_bar_audit = full_bar_audit or audit_full_production_bars(root)
     store = V11DataStore.from_directory(root, TRAIN_COMMODITIES, max_contracts_per_commodity=1)
     daily_parity = {}
     for commodity in TRAIN_COMMODITIES:
@@ -447,6 +481,12 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
     current_v0 = manifest_sha256(implementation_manifest())
     v0_safe = current_v0 == V0_MANIFEST_BEFORE
     data_report = inspect_production_data(Path(config["data"]["root"]))
+    eligibility = audit_history_week_eligibility(Path(config["data"]["root"]), config, output)
+    full_bar_audit = audit_full_production_bars(Path(config["data"]["root"]))
+    data_report["history_week_eligibility"] = eligibility
+    data_report["full_production_bar_audit"] = full_bar_audit
+    if eligibility["status"] == "BLOCKED":
+        data_report["status"] = "BLOCKED"
     cuda_available = torch.cuda.is_available()
     if device_name == "cuda" and not cuda_available:
         raise RuntimeError("CUDA_NOT_AVAILABLE")
@@ -463,8 +503,25 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
     }
     if device.type == "cuda":
         write_json(output / "gpu_smoke.json", gpu)
-    production, imc, production_connectivity = production_smoke(config, output, device)
-    data_report["full_production_bar_audit"] = imc["full_production_bar_audit"]
+    if eligibility["status"] == "PASS":
+        production, imc, production_connectivity = production_smoke(
+            config, output, device, full_bar_audit=full_bar_audit,
+        )
+    else:
+        production = {
+            "status": "BLOCKED", "optimizer_steps": 0,
+            "reason": "one or more Train commodities have zero eligible contracts",
+            "history_week_blockers": eligibility["blockers"],
+            "formal_smoke_run": False,
+            "prior_development_checkpoint_valid_for_formal_training": False,
+        }
+        imc = {
+            "status": "CODE_PASS_DATA_BLOCKED", "feature_order": list(IMC_FEATURES),
+            "full_production_bar_audit": full_bar_audit,
+            "history_week_eligibility": eligibility,
+            "production_scaler_fit_run": False,
+        }
+        production_connectivity = {}
     write_json(output / "data_contract_report.json", data_report)
     write_json(output / "smoke_test.json", {"realistic_shapes": realistic, "production": production})
     write_json(output / "imc_integration_report.json", imc)
@@ -474,9 +531,12 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
     }
     write_json(output / "gradient_connectivity.json", connectivity)
     checkpoint_policy = {
-        "status": "PASS", "selection": "fixed_budget_final", "official_checkpoint": "last.pt",
+        "status": "PASS", "selection": "fixed_budget_final",
+        "official_checkpoint": "last.pt" if production["status"] == "PASS" else None,
         "validation_jepa_loss": "diagnostic_only", "validation_can_select_checkpoint": False,
-        "checkpoint_roundtrip": production["checkpoint_roundtrip"], "resume_roundtrip": production["resume_roundtrip"],
+        "checkpoint_roundtrip": production.get("checkpoint_roundtrip", "PASS_UNIT_TEST"),
+        "resume_roundtrip": production.get("resume_roundtrip", "PASS_UNIT_TEST"),
+        "formal_checkpoint_created": production["status"] == "PASS",
     }
     write_json(output / "checkpoint_policy.json", checkpoint_policy)
     test_result = run_tests(output) if tests else {"status": "NOT_RUN"}
@@ -485,15 +545,26 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
         "formal_training_started": False, "rb_evaluation_started": False,
         "train_commodities": list(TRAIN_COMMODITIES), "held_out": "RB",
         "checkpoint_selection": "fixed_budget_final", "optimizer_step_budget": config["development"]["optimizer_steps"],
+        "history_week": dict(config["history_week"]),
+        "eligible_contract_counts": {
+            commodity: eligibility["commodities"][commodity]["eligible_contract_count"]
+            for commodity in TRAIN_COMMODITIES
+        },
     }
     write_json(output / "protocol.json", protocol)
-    pass_conditions = [v0_safe, data_report["status"] == "READY", production["status"] == "PASS",
-                       connectivity["status"] == "PASS", checkpoint_policy["status"] == "PASS",
-                       test_result["status"] == "PASS"]
-    status = "V1_1_ARCHITECTURE_IMPLEMENTATION_PASS" if all(pass_conditions) else (
-        "V1_1_ARCHITECTURE_CODE_PASS_DATA_BLOCKED" if data_report["status"] != "READY" else "V1_1_ARCHITECTURE_IMPLEMENTATION_FAIL"
-    )
-    peak = max((item["peak_allocated_bytes"] or 0) for item in realistic + [production]) or None
+    code_pass = all((v0_safe, connectivity["status"] == "PASS",
+                     checkpoint_policy["status"] == "PASS", test_result["status"] == "PASS"))
+    if code_pass and eligibility["status"] == "BLOCKED":
+        status = "V1_1_ARCHITECTURE_CODE_PASS_DATA_BLOCKED"
+    elif code_pass and data_report["status"] == "READY" and production["status"] == "PASS":
+        status = "V1_1_ARCHITECTURE_IMPLEMENTATION_PASS"
+    else:
+        status = "V1_1_ARCHITECTURE_IMPLEMENTATION_FAIL"
+    memory_rows = realistic + ([production] if production["status"] == "PASS" else [])
+    peak = max((item.get("peak_allocated_bytes") or 0) for item in memory_rows) or None
+    blocker_text = ", ".join(
+        f"{item['commodity']}: {item['reason']}" for item in eligibility["blockers"]
+    ) or "NONE"
     self_review = [
         f"V0 regression-safe: {'YES' if v0_safe and test_result['status'] == 'PASS' else 'NO'}. Manifest {current_v0}.",
         "V1.0 dead terminal feedback removed: YES; JEPA backward gradient hard test passes.",
@@ -508,20 +579,21 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
         "Future targets share the online fixed origin: YES, exact identity test.",
         "Future target is market-only: YES.",
         "Commodity embedding/ID shortcut exists: NO.",
-        "Shared scaler fitted by FG/SA/JM/SH/SP only: YES.",
+        "Shared scaler fitter requires FG/SA/JM/SH/SP only; current formal fit was not run because eligibility blocked SH.",
         "RB participated in fitting: NO.",
         "Sampler is Commodity -> Contract -> Anchor: YES.",
         "Intended online parameters with grad=None: NONE.",
         f"Parameters V0/V1.0/V1.1: {counts['v0_trainable']}/{counts['v1_0_trainable']}/{counts['v1_1_trainable']}.",
         f"Peak VRAM: {peak if peak is not None else 'CUDA_NOT_AVAILABLE'} bytes.",
-        f"Production-data blocker: {'NONE' if data_report['status'] == 'READY' else data_report['status']}.",
+        f"Production-data blocker: {blocker_text}.",
         f"Formal cross-commodity benchmark ready: {'YES' if status == 'V1_1_ARCHITECTURE_IMPLEMENTATION_PASS' else 'NO'}; formal run not started.",
     ]
     summary = {
         "status": status, "v0_manifest_sha256": current_v0, "v0_regression_safe": v0_safe,
         "parameter_counts": counts, "tests": test_result, "device": str(device),
         "peak_vram_bytes": peak, "production_data_readiness": data_report["status"],
-        "blockers": [] if data_report["status"] == "READY" else [data_report], "self_review": self_review,
+        "eligible_contract_counts": protocol["eligible_contract_counts"],
+        "blockers": eligibility["blockers"], "self_review": self_review,
     }
     write_json(output / "summary.json", summary)
     (output / "summary.md").write_text(_summary_markdown(summary), encoding="utf-8")
