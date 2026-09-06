@@ -26,8 +26,9 @@ from .config import (
     TRAIN_COMMODITIES, WEEKLY_CONTEXT_FEATURES,
 )
 from .dataset import (
-    V11ContractDataset, V11DataStore, collate_v11_batch,
-    compute_history_week_eligibility, fit_v11_shared_scaler, reliable_weekly_bounds,
+    BAR_COLUMNS, V11ContractDataset, V11DataStore, collate_v11_batch,
+    compute_history_week_eligibility, fit_v11_shared_scaler,
+    reliable_weekly_bounds_by_series,
 )
 from .model import MarketJEPAV11
 from .training import V11Trainer, assert_all_trainable_gradients, model_inputs
@@ -167,7 +168,8 @@ def lengths_from_config(model: dict) -> dict:
 def inspect_production_data(root: Path) -> dict:
     episodes = pd.read_csv(root / "contract_episodes.csv")
     required = {
-        "commodity", "contract_uid", "main_start_date", "main_end_date", "anchor_end_date", "role",
+        "commodity", "contract_uid", "delivery_year", "delivery_month", "series_key",
+        "main_start_date", "main_end_date", "anchor_end_date", "role",
     }
     missing = sorted(required - set(episodes))
     counts = episodes.groupby(["commodity", "role"]).size().to_dict()
@@ -199,6 +201,8 @@ def inspect_production_data(root: Path) -> dict:
         "lost_main_source": "contract_episodes.csv.main_end_date",
         "legal_post_main_anchor_end_source": "contract_episodes.csv.anchor_end_date",
         "minute_daily_weekly_real_contract_bars": True,
+        "historical_weekly_selection": "explicit same series_key only",
+        "overlap_stitching_rule": "keep previous delivery-year contract",
         "continuous_symbol_audit_files_accepted_for_training": False,
         "partial_bar_rule": "dynamic same-contract minute aggregation through anchor; cached 1d/1w only when closed",
         "target_rule": "all H16/H64/H256 required and sliced only inside anchor contract",
@@ -315,10 +319,14 @@ def audit_full_production_bars(root: Path) -> dict:
 def audit_history_week_eligibility(root: Path, config: dict, output: Path) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     episodes = pd.read_csv(root / "contract_episodes.csv")
-    bounds = {}
+    frames = {}
     for commodity in TRAIN_COMMODITIES:
         weekly = pd.read_csv(root / commodity / f"{commodity}_1w.csv")
-        bounds[commodity] = reliable_weekly_bounds(weekly)
+        weekly["week_end_date"] = pd.to_datetime(weekly["week_end_date"], errors="raise")
+        for column in BAR_COLUMNS:
+            weekly[column] = pd.to_numeric(weekly[column], errors="coerce")
+        frames[commodity] = {"weekly": weekly}
+    bounds = reliable_weekly_bounds_by_series(episodes, frames)
     history = config["history_week"]
     records, summaries = compute_history_week_eligibility(
         episodes, bounds, years=int(history["years"]),
@@ -344,12 +352,79 @@ def audit_history_week_eligibility(root: Path, config: dict, output: Path) -> di
     return report
 
 
+def audit_contract_lineages(root: Path, output: Path) -> dict:
+    """Persist the package's explicit lineage facts plus the frozen overlap disposition."""
+    output.mkdir(parents=True, exist_ok=True)
+    source = root / "lineage_audit.csv"
+    lineage = pd.read_csv(source)
+    required = {
+        "commodity", "delivery_month", "series_key", "contract_uid", "delivery_year",
+        "first_weekly_date", "last_weekly_date", "main_start", "main_end",
+        "previous_contract_uid", "overlap_weeks", "gap_weeks", "transition_status",
+    }
+    missing = sorted(required - set(lineage))
+    if missing:
+        raise ValueError(f"lineage audit missing columns: {missing}")
+    order = {commodity: index for index, commodity in enumerate((*TRAIN_COMMODITIES, "RB"))}
+    lineage["_commodity_order"] = lineage.commodity.map(order).fillna(len(order))
+    lineage = lineage.sort_values(
+        ["_commodity_order", "series_key", "delivery_year"], kind="mergesort",
+    ).drop(columns="_commodity_order").reset_index(drop=True)
+    lineage["overlap_resolution"] = np.where(
+        lineage.overlap_weeks.fillna(0).astype(int) > 0,
+        "keep_previous_delivery_year", "not_applicable",
+    )
+    lineage["selected_contract_for_overlap"] = np.where(
+        lineage.overlap_weeks.fillna(0).astype(int) > 0,
+        lineage.previous_contract_uid, None,
+    )
+    lineage.to_csv(output / "contract_lineage_audit.csv", index=False)
+    series = {}
+    for series_key, rows in lineage.groupby("series_key", sort=True):
+        series[str(series_key)] = {
+            "commodity": str(rows.iloc[0].commodity),
+            "delivery_month": int(rows.iloc[0].delivery_month),
+            "contract_count": int(len(rows)),
+            "overlap_transition_count": int((rows.overlap_weeks.fillna(0) > 0).sum()),
+            "overlap_weeks": int(rows.overlap_weeks.fillna(0).sum()),
+            "gap_transition_count": int((rows.gap_weeks.fillna(0) > 0).sum()),
+            "gap_weeks": int(rows.gap_weeks.fillna(0).sum()),
+        }
+    report = {
+        "status": "PASS", "source": str(source),
+        "series_mode": "same_delivery_month",
+        "overlap_stitching_rule": "keep_previous_delivery_year",
+        "series": series,
+        "fg_required_lineages": {
+            key: series[key] for key in ("FG-01", "FG-05", "FG-09")
+        },
+        "contracts": json.loads(lineage.to_json(orient="records")),
+    }
+    write_json(output / "contract_lineage_audit.json", report)
+    return report
+
+
 def production_smoke(
     config: dict, output: Path, device: torch.device, *, full_bar_audit: dict | None = None,
+    eligibility: dict | None = None,
 ) -> tuple[dict, dict, dict]:
     root = Path(config["data"]["root"])
     full_bar_audit = full_bar_audit or audit_full_production_bars(root)
-    store = V11DataStore.from_directory(root, TRAIN_COMMODITIES, max_contracts_per_commodity=1)
+    if eligibility is None:
+        eligibility = audit_history_week_eligibility(root, config, output)
+    eligible_contracts = {
+        commodity: {
+            max(
+                (record for record in eligibility["contracts"]
+                 if record["commodity"] == commodity and record["eligible"]),
+                key=lambda record: (record["main_start"], record["episode_id"]),
+            )["contract_uid"]
+        }
+        for commodity in TRAIN_COMMODITIES
+    }
+    store = V11DataStore.from_directory(
+        root, TRAIN_COMMODITIES, contracts_by_commodity=eligible_contracts,
+    )
     daily_parity = {}
     for commodity in TRAIN_COMMODITIES:
         minute = store.frames[commodity]["minute"]
@@ -417,6 +492,9 @@ def production_smoke(
         "daily_truncated_tokens": train_dataset.daily_truncated_tokens,
         "included_contracts": len(train_dataset.episode_arrays),
         "development_contract_limit_per_commodity": 1,
+        "selected_eligible_contracts": {
+            commodity: sorted(contracts) for commodity, contracts in eligible_contracts.items()
+        },
         "episodes_not_loaded_by_bounded_smoke": len(train_dataset.excluded_episodes),
         "production_loader_supports_all_contracts": True,
         "scaled_dataset_rebuilt_after_scaler_fit": True,
@@ -427,6 +505,9 @@ def production_smoke(
         "same_origin_future": True, "target_market_only": True,
         "dynamic_partial_daily_weekly": True, "future_fill_used": False,
         "history_contract_boundary_reset": True,
+        "history_series_mode": "same_delivery_month",
+        "history_overlap_stitching": "keep_previous_delivery_year",
+        "current_contract_pre_main_in_history": True,
         "minute_volume_semantics": "per-bar; same-contract sum reproduces cached Daily volume",
         "minute_to_cached_daily_parity": daily_parity,
         "full_production_bar_audit": full_bar_audit,
@@ -482,9 +563,11 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
     current_v0 = manifest_sha256(implementation_manifest())
     v0_safe = current_v0 == V0_MANIFEST_BEFORE
     data_report = inspect_production_data(Path(config["data"]["root"]))
+    lineage_audit = audit_contract_lineages(Path(config["data"]["root"]), output)
     eligibility = audit_history_week_eligibility(Path(config["data"]["root"]), config, output)
     full_bar_audit = audit_full_production_bars(Path(config["data"]["root"]))
     data_report["history_week_eligibility"] = eligibility
+    data_report["contract_lineage_audit"] = lineage_audit
     data_report["full_production_bar_audit"] = full_bar_audit
     if eligibility["status"] == "BLOCKED":
         data_report["status"] = "BLOCKED"
@@ -506,7 +589,7 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
         write_json(output / "gpu_smoke.json", gpu)
     if eligibility["status"] == "PASS":
         production, imc, production_connectivity = production_smoke(
-            config, output, device, full_bar_audit=full_bar_audit,
+            config, output, device, full_bar_audit=full_bar_audit, eligibility=eligibility,
         )
     else:
         production = {
@@ -520,6 +603,7 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
             "status": "CODE_PASS_DATA_BLOCKED", "feature_order": list(IMC_FEATURES),
             "full_production_bar_audit": full_bar_audit,
             "history_week_eligibility": eligibility,
+            "contract_lineage_audit": lineage_audit,
             "production_scaler_fit_run": False,
         }
         production_connectivity = {}
@@ -547,6 +631,7 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
         "train_commodities": list(TRAIN_COMMODITIES), "held_out": "RB",
         "checkpoint_selection": "fixed_budget_final", "optimizer_step_budget": config["development"]["optimizer_steps"],
         "history_week": dict(config["history_week"]),
+        "historical_weekly_selection": "same series_key; overlap keeps previous delivery year",
         "eligible_contract_counts": {
             commodity: eligibility["commodities"][commodity]["eligible_contract_count"]
             for commodity in TRAIN_COMMODITIES
@@ -582,6 +667,7 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
         "Commodity/Contract state changes Minute tokens before belief compression: YES.",
         "IMC is in the production V1.1 dataset/model path: YES.",
         "Historical Weekly IMC resets per real-contract segment: YES.",
+        "Historical Weekly contract selection uses only the current contract's explicit series_key: YES.",
         "Future targets share the online fixed origin: YES, exact identity test.",
         "Future target is market-only: YES.",
         "Commodity embedding/ID shortcut exists: NO.",

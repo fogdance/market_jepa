@@ -53,6 +53,7 @@ DEFAULT_V11_CONFIG: dict[str, Any] = {
         "commodity_years": {"SH": 2},
         "capacity": 156,
         "require_full_history": True,
+        "series_mode": "same_delivery_month",
     },
     "model": {
         "minute_market_dim": len(IMC_FEATURES),
@@ -134,9 +135,11 @@ def validate_v11_config(config: dict[str, Any]) -> None:
         raise ValueError("data/model capacities differ")
     history = config.get("history_week")
     if not isinstance(history, dict) or set(history) != {
-        "years", "commodity_years", "capacity", "require_full_history",
+        "years", "commodity_years", "capacity", "require_full_history", "series_mode",
     }:
-        raise ValueError("history_week requires years/commodity_years/capacity/require_full_history")
+        raise ValueError(
+            "history_week requires years/commodity_years/capacity/require_full_history/series_mode"
+        )
     if isinstance(history["years"], bool) or not isinstance(history["years"], int) or history["years"] <= 0:
         raise ValueError("history_week.years must be a positive integer")
     commodity_years = history["commodity_years"]
@@ -156,6 +159,8 @@ def validate_v11_config(config: dict[str, Any]) -> None:
         raise ValueError("history_week.require_full_history must be boolean")
     if config.get("profile") != "debug" and history["require_full_history"] is not True:
         raise ValueError("formal V1.1 requires the configured full historical coverage")
+    if history["series_mode"] != "same_delivery_month":
+        raise ValueError("V1.1 requires history_week.series_mode=same_delivery_month")
     training = config["training"]
     for name in ("optimizer", "learning_rate", "weight_decay", "betas", "eps", "ema_tau",
                  "lambda_var", "lambda_cov", "variance_floor", "gradient_clip_norm",

@@ -36,14 +36,14 @@ The four memories are tokenized and read separately. Daily and Current Weekly ha
 
 ## Data hierarchy and causal as-of construction
 
-`contract_episodes.csv` provides `contract_uid`, `main_start_date`, `main_end_date`, `anchor_end_date` and role. Each real contract is an independent episode. Minute windows, Daily lifecycle, Current Weekly lifecycle and every JEPA target remain inside that `contract_uid`.
+`contract_episodes.csv` provides explicit `contract_uid`, `delivery_year`, `delivery_month`, `series_key`, `main_start_date`, `main_end_date`, `anchor_end_date` and role. Each real contract is an independent episode. Minute windows, Daily lifecycle, Current Weekly lifecycle and every JEPA target remain inside that `contract_uid`.
 
 At each minute anchor:
 
 - Minute is the latest 512 same-contract rows, left padded.
 - Daily is completed lifecycle days plus exactly one current partial bar aggregated from same-contract minute rows with `datetime <= anchor` and the anchor `trading_date`.
 - Current Weekly is completed lifecycle weeks plus exactly one partial lifecycle week aggregated only through anchor.
-- Historical Weekly is the preceding three-year interval `[main_start-3Y, main_start)`, clipped to 156 tokens. Each visible real-contract episode resets IMC and marks its first token with `contract_boundary=1`; the segment key is `(contract_uid, episode_id)`.
+- Historical Weekly is the configured interval `[main_start-years, main_start)`, clipped to 156 tokens and selected strictly from the current contract's explicit `series_key`. It is not constructed from chronological main-contract episodes. Closed pre-main Weekly rows of the current `contract_uid` form the most recent historical segment. Each visible real contract resets IMC and marks its first token with `contract_boundary=1`.
 - Anchors after loss of main status are bounded by `anchor_end_date`; the supplied package uses the episode calendar's 15-trading-day extension policy.
 
 Cached 1d/1w bars are never used as the current forming bar. Weekly lifecycle bars are reconstructed from contract-local closed Daily lifecycle bars so a main-start week cannot import pre-main days. `bar_is_partial` and causal progress fields are explicit context features. Context numeric values are bounded to `[0,1]`: days since main/256, days since lost-main/21, observed intraday bar count/512, weeks ago/156, contract age/64 and observed trading days/5. Intraday progress therefore does not use wall-clock gaps across night sessions.
@@ -59,9 +59,14 @@ history_week:
     SH: 2
   capacity: 156
   require_full_history: true
+  series_mode: same_delivery_month
 ```
 
-For each commodity independently, the first reliable Weekly row defines the coverage origin. An episode is eligible exactly when `main_start >= first_weekly_date + required_years`, where `required_years` is its explicit commodity override or the global default. Capacity is not used as a proxy for coverage: an early contract cannot enter training with mostly PAD, while genuine missing weeks inside an eligible configured calendar window remain PAD plus mask. Sampling receives only this prefiltered contract population and never retries an ineligible draw. The override is data eligibility/window configuration only; commodity identity remains absent from model construction and forward representation.
+For each lineage independently, the first reliable Weekly row defines the coverage origin. An episode is eligible exactly when `main_start >= first_lineage_weekly_date + required_years`, where `required_years` is its explicit commodity override or the global default. Capacity is not used as a proxy for coverage: an early contract cannot enter training with mostly PAD, while genuine missing weeks inside an eligible configured calendar window remain PAD plus mask. Sampling receives only this prefiltered contract population and never retries an ineligible draw. `series_key` is data-selection metadata only; it remains absent from model construction and forward representation.
+
+Within one lineage, Weekly rows are keyed by ISO calendar week. When adjacent delivery years overlap, the previous (smaller) `delivery_year` contract supplies that week; the later contract's row is discarded. No OHLCV/OI aggregation occurs across contracts. The supplied lineage audit reports 17 such one-week FG transitions: six in FG-01, six in FG-05, and five in FG-09. FG-09 also contains one reported gap week, represented naturally by missing time rather than fabricated data.
+
+Historical market tokens read only the selected Weekly rows. They do not consult Daily bars; their closed-week progress context is the completed value `1`. Current Weekly retains its separate causal Daily/minute lifecycle construction.
 
 ## Tensor and mask contract
 
@@ -95,7 +100,7 @@ All four market inputs and future targets use the same nine ordered coordinates:
 8. `Volume/M0_volume`
 9. `Volume/median(previous 20 Volume)`
 
-Minute `P0` is the first valid window Close and `OI0` is its OI. Its fixed Volume baseline is the median of exactly 20 bars immediately before the window. Daily and Current Weekly Price/OI origins are fixed for the whole lifecycle at the first observable main-start minute Open/OI; their Volume baselines use 20 closed same-contract Daily/Weekly bars before main start. Historical Weekly uses those same main-start Price/OI references and the same pre-main fixed Volume baseline for each historical episode, so a contract retains lifecycle coordinates when it moves from Current to Historical memory. Historical Q20 still uses the 20 observations immediately before the visible memory segment. The directory loader scans causal episode origins without retaining all historical minute bars.
+Minute `P0` is the first valid window Close and `OI0` is its OI. Its fixed Volume baseline is the median of exactly 20 bars immediately before the window. Daily and Current Weekly Price/OI origins are fixed for the whole lifecycle at the first observable main-start minute Open/OI; their Volume baselines use 20 closed same-contract Daily/Weekly bars before main start. Each Historical Weekly real-contract segment uses its first visible Weekly Close/OI as fixed origin and only preceding rows from that same contract for step and Volume warm-up. This prevents a current contract's pre-main history from reading its future main-start origin and prevents all cross-contract deltas.
 
 Unavailable or nonpositive baselines produce numeric zero plus coordinate validity false; no epsilon and no future fill are used. A single post-IMC scaler is fitted jointly from FG/SA/JM/SH/SP online-memory snapshots. It stores means, standard deviations, feature counts, per-source population counts, exact feature order, fitted commodities and a SHA-256 checksum. The fitter rejects RB and rejects a population missing any of the five Train commodities. Historical-memory cache entries are always raw IMC; the frozen scaler is applied only when a sample is returned. A read-only `scaler` property plus `set_scaler()` prevents the former stale-cache lifecycle bug.
 
@@ -144,11 +149,11 @@ The configured eligibility audit over the supplied production package is:
 | FG | 3 | 2017-12-22 | 33 | 16 | 17 | FG202109 | 2021-04-08 |
 | SA | 3 | 2019-12-06 | 21 | 10 | 11 | SA202309 | 2023-03-27 |
 | JM | 3 | 2017-12-29 | 38 | 21 | 17 | JM202109 | 2021-04-21 |
-| SH | 2 | 2023-09-15 | 12 | 7 | 5 | SH202603 | 2025-12-11 |
-| SP | 3 | 2018-11-30 | 34 | 16 | 18 | SP202205 | 2021-12-16 |
+| SH | 2 | 2023-09-15 | 12 | 10 | 2 | SH202605 | 2026-02-25 |
+| SP | 3 | 2018-11-30 | 34 | 17 | 17 | SP202209 | 2022-04-08 |
 
-Every formal Train commodity now has a nonempty eligible population. The implementation does not silently alter either the global default or the SH override and does not exclude a missing commodity from the uniform benchmark. Per-contract evidence, including each episode's `required_history_years`, is written to `history_week_eligibility.csv` and `history_week_eligibility.json` in the development artifact directory.
+Every formal Train commodity has a nonempty lineage-qualified population. The implementation does not silently alter either the global default or the SH override and does not exclude a missing commodity from the uniform benchmark. Per-contract evidence includes `series_key`, delivery metadata, lineage bounds and required years. The development artifact directory contains both history eligibility and contract-lineage CSV/JSON reports.
 
 ## Deviations from the frozen design
 
-There are no theory or architecture deviations. The configured SH eligibility window is two calendar years while every unlisted commodity inherits the three-year default; all retain capacity 156 and explicit PAD/mask semantics. The development smoke limits loaded current-minute episodes to one recent eligible episode per Train commodity to bound runtime; it is not a formal benchmark run. No RB data is used for fitting. RB validation/test should remain one held-out role with time/anchor splits; independently, historical visibility is causal by timestamp and does not discard earlier episodes merely because a role label differs.
+There are no theory or architecture deviations. Historical contract selection follows explicit `series_key`, with the user-frozen overlap rule retaining the previous delivery year. The configured SH eligibility window is two calendar years while every unlisted commodity inherits the three-year default; all retain capacity 156 and explicit PAD/mask semantics. The development smoke limits loaded current-minute episodes to recent eligible episodes per Train commodity to bound runtime; it is not a formal benchmark run. No RB data is used for fitting. Historical visibility is causal by timestamp and independent of role labels.

@@ -15,6 +15,7 @@ history_week:
     SH: 2
   capacity: 156
   require_full_history: true
+  series_mode: same_delivery_month
 model:
   minute_market_dim: 9
   minute_context_dim: 5

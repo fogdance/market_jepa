@@ -124,6 +124,8 @@ def _make_store(commodities=("FG",), contracts_per_commodity: int = 3) -> V11Dat
             weekly_parts.append(weekly)
             episode_rows.append({
                 "commodity": commodity, "contract_uid": contract,
+                "delivery_year": 2022 + contract_index, "delivery_month": 1,
+                "series_key": f"{commodity}-01",
                 "episode_id": contract_index, "main_start_date": days[0],
                 "main_end_date": days[7], "anchor_end_date": days[9], "role": "train",
             })
@@ -133,6 +135,28 @@ def _make_store(commodities=("FG",), contracts_per_commodity: int = 3) -> V11Dat
             "weekly": pd.concat(weekly_parts, ignore_index=True),
         }
     return V11DataStore(pd.DataFrame(episode_rows), frames)
+
+
+def _make_fg_lineage_store() -> V11DataStore:
+    store = _make_store(("FG",), contracts_per_commodity=6)
+    identities = (
+        ("FG202401", 2024, 1, "FG-01"), ("FG202405", 2024, 5, "FG-05"),
+        ("FG202501", 2025, 1, "FG-01"), ("FG202505", 2025, 5, "FG-05"),
+        ("FG202601", 2026, 1, "FG-01"), ("FG202605", 2026, 5, "FG-05"),
+    )
+    mapping = {f"FG{index + 1:02d}": uid for index, (uid, _, _, _) in enumerate(identities)}
+    episodes = store.episode_table.copy()
+    episodes["contract_uid"] = episodes.contract_uid.map(mapping)
+    for index, (uid, year, month, series_key) in enumerate(identities):
+        episodes.loc[episodes.episode_id == index, [
+            "delivery_year", "delivery_month", "series_key", "role",
+        ]] = [year, month, series_key, "train" if index >= 4 else "validation"]
+    frames = {}
+    for scale, original in store.frames["FG"].items():
+        frame = original.copy()
+        frame["contract_uid"] = frame.contract_uid.map(mapping)
+        frames[scale] = frame
+    return V11DataStore(episodes, {"FG": frames})
 
 
 def _dataset_config() -> dict:
@@ -266,29 +290,74 @@ def test_v11_current_weekly_never_crosses_contract(contract_dataset):
     assert sample["current_weekly_context"][~sample["current_weekly_mask"], 3].sum() == 1
 
 
-def test_v11_history_weekly_boundary_flags(contract_dataset):
-    arrays = contract_dataset.episode_arrays[2]
-    market, context, mask, validity, boundary = contract_dataset._history(arrays.episode)
-    assert market.shape == validity.shape == (8, len(IMC_FEATURES))
-    assert boundary[~mask].sum() == 2
+def test_v11_history_weekly_boundary_flags():
+    config = _dataset_config(); config["history_week"]["capacity"] = 64
+    dataset = V11ContractDataset(_make_store(), config)
+    arrays = dataset.episode_arrays[2]
+    market, context, mask, validity, boundary = dataset._history(arrays.episode)
+    assert market.shape == validity.shape == (64, len(IMC_FEATURES))
+    assert boundary[~mask].sum() == 3
     assert np.all(boundary[mask] == 0)
     assert np.all(context[~mask, 2] == 0)
 
 
-def test_v11_history_weekly_resets_on_contract_boundary(contract_dataset):
-    arrays = contract_dataset.episode_arrays[2]
-    sample = contract_dataset[contract_dataset.global_index(2, 0)]
-    valid = ~sample["history_weekly_mask"]
-    boundary = sample["history_weekly_contract_boundary"].bool() & valid
-    assert boundary.sum() == 2
-    values = sample["history_weekly_market"][boundary]
-    for index, episode_index in enumerate((0, 1)):
-        historical = contract_dataset.episode_arrays[episode_index]
-        reference_price, reference_oi = contract_dataset.store.lifecycle_references[historical.episode.key]
-        first_week = historical.current_weekly_frame.iloc[0]
-        assert values[index, 3] == pytest.approx(np.log(first_week.close / reference_price), rel=1e-5)
-        assert values[index, 5] == pytest.approx(np.log(first_week.open_interest / reference_oi), rel=1e-5)
-    assert arrays.episode.main_start > contract_dataset.episode_arrays[1].episode.main_start
+def test_lineage_contract_boundary_resets_imc():
+    config = _dataset_config(); config["history_week"]["capacity"] = 64
+    dataset = V11ContractDataset(_make_store(), config)
+    current = dataset.episode_arrays[2]
+    market, _, mask, validity, boundary = dataset._history(current.episode)
+    boundary_positions = np.flatnonzero((~mask) & boundary.astype(bool))
+    assert len(boundary_positions) == 3
+    np.testing.assert_allclose(market[boundary_positions, 3], 0, rtol=0, atol=1e-7)
+    np.testing.assert_allclose(market[boundary_positions, 5], 0, rtol=0, atol=1e-7)
+    assert validity[boundary_positions, 3].all() and validity[boundary_positions, 5].all()
+
+
+def test_fg601_history_contains_only_fg01_lineage():
+    dataset = V11ContractDataset(_make_fg_lineage_store(), _dataset_config())
+    current = next(item for item in dataset.episode_arrays if item.episode.contract_uid == "FG202601")
+    rows = dataset.history_weekly_rows(current.episode)
+    assert set(rows.series_key) == {"FG-01"}
+    assert set(rows.contract_uid) <= {"FG202401", "FG202501", "FG202601"}
+
+
+def test_fg605_history_contains_only_fg05_lineage():
+    dataset = V11ContractDataset(_make_fg_lineage_store(), _dataset_config())
+    current = next(item for item in dataset.episode_arrays if item.episode.contract_uid == "FG202605")
+    rows = dataset.history_weekly_rows(current.episode)
+    assert set(rows.series_key) == {"FG-05"}
+    assert set(rows.contract_uid) <= {"FG202405", "FG202505", "FG202605"}
+
+
+def test_history_excludes_other_delivery_months():
+    dataset = V11ContractDataset(_make_fg_lineage_store(), _dataset_config())
+    for current in dataset.episode_arrays:
+        rows = dataset.history_weekly_rows(current.episode)
+        assert (rows.delivery_month == current.episode.delivery_month).all()
+        assert (rows.series_key == current.episode.series_key).all()
+
+
+def test_lineage_overlap_keeps_previous_delivery_year():
+    store = _make_fg_lineage_store()
+    weekly = store.frames["FG"]["weekly"]
+    template = weekly.loc[weekly.contract_uid == "FG202401"].iloc[-1].copy()
+    overlap_date = pd.Timestamp("2022-08-25")
+    additions = []
+    for contract_uid, close in (("FG202401", 111.0), ("FG202501", 222.0)):
+        row = template.copy()
+        row["contract_uid"], row["week_end_date"] = contract_uid, overlap_date
+        row[["open", "high", "low", "close"]] = [close, close + 1, close - 1, close]
+        additions.append(row)
+    store.frames["FG"]["weekly"] = pd.concat((weekly, pd.DataFrame(additions)), ignore_index=True)
+    dataset = V11ContractDataset(store, _dataset_config())
+    current = next(item for item in dataset.episode_arrays if item.episode.contract_uid == "FG202601")
+    rows = dataset.history_weekly_rows(current.episode)
+    iso = rows.period_end.dt.isocalendar()
+    target = overlap_date.isocalendar()
+    selected = rows.loc[(iso.year == target.year) & (iso.week == target.week)]
+    assert len(selected) == 1
+    assert selected.iloc[0].contract_uid == "FG202401"
+    assert int(selected.iloc[0].delivery_year) == 2024
 
 
 def test_v11_history_cache_respects_shared_scaler():
@@ -308,22 +377,20 @@ def test_v11_history_cache_respects_shared_scaler():
         dataset.scaler = scaler
 
 
-def test_v11_history_and_current_weekly_share_lifecycle_coordinates():
-    dataset = V11ContractDataset(_make_store(), _dataset_config())
-    historical = dataset.episode_arrays[0]
-    current_values, current_validity = V11IMCTransform.transform(
-        historical.current_weekly_frame.loc[:, BAR_COLUMNS].to_numpy(dtype=np.float64),
-        origin=historical.weekly_origin, prior_volume=historical.weekly_prior_volume,
-        previous_close=historical.weekly_previous_close, previous_oi=historical.weekly_previous_oi,
-    )
-    current = dataset.episode_arrays[2]
-    market, _, mask, validity, boundary = dataset._history(current.episode)
-    visible_market, visible_validity = market[~mask], validity[~mask]
-    assert np.flatnonzero(boundary[~mask])[1] > 0
-    # First lifecycle week is identical. Later history ends at main_end while
-    # Current memory may legally continue through anchor_end.
-    np.testing.assert_allclose(visible_market[0], current_values[0], rtol=0, atol=0)
-    np.testing.assert_array_equal(visible_validity[0], current_validity[0])
+def test_current_contract_pre_main_enters_history():
+    dataset = V11ContractDataset(_make_fg_lineage_store(), _dataset_config())
+    current = next(item for item in dataset.episode_arrays if item.episode.contract_uid == "FG202601")
+    rows = dataset.history_weekly_rows(current.episode)
+    current_rows = rows.loc[rows.contract_uid == "FG202601"]
+    assert not current_rows.empty
+    assert (current_rows.period_end < current.episode.main_start).all()
+
+
+def test_current_weekly_starts_at_main_start():
+    dataset = V11ContractDataset(_make_fg_lineage_store(), _dataset_config())
+    for current in dataset.episode_arrays:
+        assert not current.current_weekly_frame.empty
+        assert (current.current_weekly_frame.period_end >= current.episode.main_start).all()
 
 
 def test_v11_context_features_are_bounded_counts_not_wall_clock():
@@ -342,25 +409,21 @@ def test_v11_context_features_are_bounded_counts_not_wall_clock():
 def test_v11_history_visibility_is_causal_not_role_partitioned():
     store = _make_store()
     store.episode_table.loc[store.episode_table.episode_id == 0, "role"] = "validation"
-    dataset = V11ContractDataset(store, _dataset_config(), role="train")
+    config = _dataset_config(); config["history_week"]["capacity"] = 64
+    dataset = V11ContractDataset(store, config, role="train")
     current = next(arrays for arrays in dataset.episode_arrays if arrays.episode.episode_id == 2)
     history = dataset._history(current.episode)
-    assert history[4][~history[2]].sum() == 2
+    assert history[4][~history[2]].sum() == 3
 
 
-def test_v11_history_truncation_boundary_uses_episode_id():
-    original = _make_store()
-    episodes = original.episode_table.copy()
-    episodes["contract_uid"] = "FG_REENTRY"
-    frames = original.frames
-    for frame in frames["FG"].values():
-        frame["contract_uid"] = "FG_REENTRY"
-    config = _dataset_config(); config["history_week"]["capacity"] = 4
-    dataset = V11ContractDataset(V11DataStore(episodes, frames), config)
-    current = next(arrays for arrays in dataset.episode_arrays if arrays.episode.episode_id == 2)
-    market, _, mask, _, boundary = dataset._history(current.episode)
-    assert market.shape[0] == 4 and (~mask).sum() == 4
-    assert boundary[~mask].sum() == 2
+def test_v11_history_truncation_preserves_real_contract_boundary():
+    config = _dataset_config(); config["history_week"]["capacity"] = 12
+    dataset = V11ContractDataset(_make_store(), config)
+    current = dataset.episode_arrays[2]
+    rows = dataset.history_weekly_rows(current.episode).tail(12)
+    _, _, mask, _, boundary = dataset._history(current.episode)
+    expected = np.r_[True, rows.contract_uid.to_numpy()[1:] != rows.contract_uid.to_numpy()[:-1]]
+    np.testing.assert_array_equal(boundary[~mask].astype(bool), expected)
 
 
 def test_v11_target_never_crosses_contract(contract_dataset):
@@ -651,6 +714,7 @@ def test_v11_contract_filtered_if_history_shorter_than_config():
 def test_v11_history_years_is_configurable():
     assert DEFAULT_V11_CONFIG["history_week"]["years"] == 3
     assert DEFAULT_V11_CONFIG["history_week"]["commodity_years"] == {"SH": 2}
+    assert DEFAULT_V11_CONFIG["history_week"]["series_mode"] == "same_delivery_month"
     formal_two_years = deepcopy(DEFAULT_V11_CONFIG)
     formal_two_years["history_week"]["years"] = 2
     validate_v11_config(formal_two_years)
@@ -675,6 +739,32 @@ def test_v11_late_listed_commodity_uses_own_history_start():
     assert dataset.history_week_eligibility_summary["SH"]["required_history_years"] == 1
 
 
+def test_history_eligibility_is_lineage_specific():
+    store = _make_fg_lineage_store()
+    current_05 = store.episodes[("FG", "FG202605", 5)]
+    series_05_contracts = {
+        identity.contract_uid for identity in store.contracts.values()
+        if identity.series_key == "FG-05"
+    }
+    weekly = store.frames["FG"]["weekly"]
+    store.frames["FG"]["weekly"] = weekly.loc[
+        ~weekly.contract_uid.isin(series_05_contracts)
+        | (weekly.week_end_date >= current_05.main_start - pd.Timedelta(days=180))
+    ].copy()
+    config = _dataset_config(); config["history_week"].update(
+        years=1, commodity_years={}, require_full_history=True,
+    )
+    dataset = V11ContractDataset(store, config)
+    decisions = {
+        record["contract_uid"]: record for record in dataset.history_week_eligibility_records
+    }
+    assert decisions["FG202601"]["eligible"] is True
+    assert decisions["FG202605"]["eligible"] is False
+    assert decisions["FG202601"]["series_key"] == "FG-01"
+    assert decisions["FG202605"]["series_key"] == "FG-05"
+    assert [item.episode.contract_uid for item in dataset.episode_arrays] == ["FG202601"]
+
+
 def test_v11_sampler_never_selects_ineligible_contract():
     store = _prepend_reliable_week(
         _make_store(TRAIN_COMMODITIES), {commodity: "2019-03-01" for commodity in TRAIN_COMMODITIES},
@@ -687,6 +777,32 @@ def test_v11_sampler_never_selects_ineligible_contract():
     for index in sampler:
         episode_index = np.searchsorted(dataset.offsets, index, side="right") - 1
         assert dataset.episode_arrays[episode_index].episode.episode_id in (1, 2)
+
+
+def test_sampler_never_uses_short_lineage_history():
+    original = _make_store(TRAIN_COMMODITIES)
+    episodes = original.episode_table.copy()
+    episodes.loc[
+        (episodes.commodity == "FG") & (episodes.episode_id == 0),
+        ["delivery_month", "series_key"],
+    ] = [5, "FG-05"]
+    store = V11DataStore(episodes, original.frames)
+    for commodity in TRAIN_COMMODITIES:
+        weekly = store.frames[commodity]["weekly"]
+        contract_uid = f"{commodity}02" if commodity == "FG" else f"{commodity}01"
+        row = weekly.loc[weekly.contract_uid == contract_uid].iloc[0].copy()
+        row["week_end_date"] = pd.Timestamp("2020-01-03")
+        store.frames[commodity]["weekly"] = pd.concat((pd.DataFrame([row]), weekly), ignore_index=True)
+    config = _dataset_config(); config["history_week"].update(
+        years=1, commodity_years={}, require_full_history=True,
+    )
+    dataset = V11ContractDataset(store, config)
+    assert ("FG", "FG01", 0) not in set(dataset.eligible_contracts_by_commodity["FG"])
+    sampler = HierarchicalCommodityContractSampler(dataset, 10_000, seed=31)
+    for index in sampler:
+        episode_index = np.searchsorted(dataset.offsets, index, side="right") - 1
+        episode = dataset.episode_arrays[episode_index].episode
+        assert not (episode.commodity == "FG" and episode.contract_uid == "FG01")
 
 
 def test_v11_no_short_history_silent_fallback():

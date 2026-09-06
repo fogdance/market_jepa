@@ -24,6 +24,9 @@ BAR_COLUMNS = ("open", "high", "low", "close", "volume", "open_interest")
 class ContractEpisode:
     commodity: str
     contract_uid: str
+    delivery_year: int
+    delivery_month: int
+    series_key: str
     episode_id: int
     main_start: pd.Timestamp
     main_end: pd.Timestamp
@@ -34,9 +37,14 @@ class ContractEpisode:
     def key(self) -> tuple[str, str, int]:
         return self.commodity, self.contract_uid, self.episode_id
 
-    @property
-    def segment_key(self) -> tuple[str, int]:
-        return self.contract_uid, self.episode_id
+
+@dataclass(frozen=True)
+class ContractIdentity:
+    commodity: str
+    contract_uid: str
+    delivery_year: int
+    delivery_month: int
+    series_key: str
 
 
 @dataclass
@@ -199,9 +207,31 @@ def reliable_weekly_bounds(frame: pd.DataFrame) -> tuple[pd.Timestamp | None, pd
     return (None, None) if timestamps.empty else (pd.Timestamp(timestamps.min()), pd.Timestamp(timestamps.max()))
 
 
+def reliable_weekly_bounds_by_series(
+    episodes: pd.DataFrame,
+    frames: dict[str, dict[str, pd.DataFrame]],
+) -> dict[tuple[str, str], tuple[pd.Timestamp | None, pd.Timestamp | None]]:
+    """Map explicit (commodity, series_key) identities to reliable Weekly bounds."""
+    identities = episodes.loc[:, [
+        "commodity", "contract_uid", "delivery_year", "delivery_month", "series_key",
+    ]].drop_duplicates()
+    result: dict[tuple[str, str], tuple[pd.Timestamp | None, pd.Timestamp | None]] = {}
+    for commodity, scales in frames.items():
+        metadata = identities.loc[identities.commodity == commodity]
+        annotated = scales["weekly"].merge(
+            metadata, on=["commodity", "contract_uid"], how="left", validate="many_to_one",
+        )
+        if annotated["series_key"].isna().any():
+            missing = sorted(annotated.loc[annotated.series_key.isna(), "contract_uid"].astype(str).unique())
+            raise ValueError(f"weekly rows lack explicit lineage metadata: {missing[:3]}")
+        for series_key, lineage in annotated.groupby("series_key", sort=True):
+            result[(commodity, str(series_key))] = reliable_weekly_bounds(lineage)
+    return result
+
+
 def compute_history_week_eligibility(
     episodes: pd.DataFrame,
-    weekly_bounds: dict[str, tuple[pd.Timestamp | None, pd.Timestamp | None]],
+    weekly_bounds: dict[tuple[str, str], tuple[pd.Timestamp | None, pd.Timestamp | None]],
     *,
     years: int,
     commodity_years: dict[str, int] | None,
@@ -213,13 +243,14 @@ def compute_history_week_eligibility(
     table["main_start_date"] = pd.to_datetime(table["main_start_date"], errors="raise")
     records: list[dict[str, Any]] = []
     summaries: dict[str, dict[str, Any]] = {}
-    commodities = sorted(set(table.commodity.astype(str)) | set(weekly_bounds))
+    commodities = sorted(set(table.commodity.astype(str)) | {key[0] for key in weekly_bounds})
     for commodity in commodities:
-        first, last = weekly_bounds.get(commodity, (None, None))
         required_years = int((commodity_years or {}).get(commodity, years))
         commodity_records = []
         for row in table.loc[table.commodity == commodity].sort_values("main_start_date").itertuples(index=False):
             main_start = pd.Timestamp(row.main_start_date)
+            series_key = str(row.series_key)
+            first, last = weekly_bounds.get((commodity, series_key), (None, None))
             available_years = 0.0 if first is None else max(0.0, (main_start - first).days / 365.2425)
             coverage = first is not None and main_start >= first + pd.DateOffset(years=required_years)
             eligible = bool(coverage or not require_full_history)
@@ -228,7 +259,9 @@ def compute_history_week_eligibility(
             )
             record = {
                 "commodity": commodity, "contract_uid": str(row.contract_uid),
-                "episode_id": int(row.episode_id), "main_start": main_start.date().isoformat(),
+                "delivery_year": int(row.delivery_year), "delivery_month": int(row.delivery_month),
+                "series_key": series_key, "episode_id": int(row.episode_id),
+                "main_start": main_start.date().isoformat(),
                 "first_weekly_date": None if first is None else first.date().isoformat(),
                 "last_weekly_date": None if last is None else last.date().isoformat(),
                 "required_history_years": required_years,
@@ -238,6 +271,8 @@ def compute_history_week_eligibility(
             records.append(record); commodity_records.append(record)
         eligible_records = [record for record in commodity_records if record["eligible"]]
         earliest = eligible_records[0] if eligible_records else None
+        first_dates = [record["first_weekly_date"] for record in commodity_records if record["first_weekly_date"]]
+        last_dates = [record["last_weekly_date"] for record in commodity_records if record["last_weekly_date"]]
         if eligible_records:
             summary_reason = ""
         elif commodity_records:
@@ -245,8 +280,8 @@ def compute_history_week_eligibility(
         else:
             summary_reason = f"no {role} contract episodes"
         summaries[commodity] = {
-            "first_weekly_date": None if first is None else first.date().isoformat(),
-            "last_weekly_date": None if last is None else last.date().isoformat(),
+            "first_weekly_date": min(first_dates) if first_dates else None,
+            "last_weekly_date": max(last_dates) if last_dates else None,
             "required_history_years": required_years,
             "total_contract_count": len(commodity_records),
             "filtered_insufficient_history_count": len(commodity_records) - len(eligible_records),
@@ -265,12 +300,28 @@ class V11DataStore:
         lifecycle_references: dict[tuple[str, str, int], tuple[float, float]] | None = None,
     ) -> None:
         required = {
-            "commodity", "contract_uid", "episode_id", "main_start_date",
-            "main_end_date", "anchor_end_date", "role",
+            "commodity", "contract_uid", "delivery_year", "delivery_month", "series_key",
+            "episode_id", "main_start_date", "main_end_date", "anchor_end_date", "role",
         }
         if required - set(episodes):
             raise ValueError(f"episode table missing columns: {sorted(required - set(episodes))}")
         table = episodes.copy()
+        table["delivery_year"] = pd.to_numeric(table["delivery_year"], errors="raise").astype(int)
+        table["delivery_month"] = pd.to_numeric(table["delivery_month"], errors="raise").astype(int)
+        if not table["delivery_month"].between(1, 12).all():
+            raise ValueError("delivery_month must be in 1..12")
+        if table["series_key"].isna().any() or (table["series_key"].astype(str).str.len() == 0).any():
+            raise ValueError("series_key must be explicit and nonempty")
+        expected_series = table.apply(
+            lambda row: f"{row.commodity}-{int(row.delivery_month):02d}", axis=1,
+        )
+        if not (table["series_key"].astype(str) == expected_series).all():
+            raise ValueError("series_key disagrees with explicit commodity/delivery_month metadata")
+        identity_counts = table.groupby(["commodity", "contract_uid"])[
+            ["delivery_year", "delivery_month", "series_key"]
+        ].nunique(dropna=False)
+        if (identity_counts > 1).any(axis=None):
+            raise ValueError("contract_uid has conflicting delivery lineage metadata")
         for column in ("main_start_date", "main_end_date", "anchor_end_date"):
             table[column] = pd.to_datetime(table[column], errors="raise")
         if table.duplicated(["commodity", "contract_uid", "episode_id"]).any():
@@ -280,11 +331,20 @@ class V11DataStore:
         self.episode_table = table
         self.frames = frames
         self.source_root = source_root
+        self.contracts = {
+            (str(row.commodity), str(row.contract_uid)): ContractIdentity(
+                str(row.commodity), str(row.contract_uid), int(row.delivery_year),
+                int(row.delivery_month), str(row.series_key),
+            )
+            for row in table.drop_duplicates(["commodity", "contract_uid"]).itertuples(index=False)
+        }
         self.episodes = {
             (str(row.commodity), str(row.contract_uid), int(row.episode_id)): ContractEpisode(
-                str(row.commodity), str(row.contract_uid), int(row.episode_id),
-                pd.Timestamp(row.main_start_date), pd.Timestamp(row.main_end_date),
-                pd.Timestamp(row.anchor_end_date), str(row.role),
+                commodity=str(row.commodity), contract_uid=str(row.contract_uid),
+                delivery_year=int(row.delivery_year), delivery_month=int(row.delivery_month),
+                series_key=str(row.series_key), episode_id=int(row.episode_id),
+                main_start=pd.Timestamp(row.main_start_date), main_end=pd.Timestamp(row.main_end_date),
+                anchor_end=pd.Timestamp(row.anchor_end_date), role=str(row.role),
             )
             for row in table.itertuples(index=False)
         }
@@ -320,7 +380,10 @@ class V11DataStore:
         commodities: Iterable[str] = TRAIN_COMMODITIES,
         *,
         max_contracts_per_commodity: int | None = None,
+        contracts_by_commodity: dict[str, set[str]] | None = None,
     ) -> "V11DataStore":
+        if max_contracts_per_commodity is not None and contracts_by_commodity is not None:
+            raise ValueError("contract limit and explicit contract selection are mutually exclusive")
         root = Path(root)
         episodes = pd.read_csv(root / "contract_episodes.csv")
         requested = tuple(commodities)
@@ -330,15 +393,20 @@ class V11DataStore:
         for commodity in requested:
             candidates = episodes.loc[episodes.commodity == commodity].sort_values("main_start_date")
             selected = candidates
-            if max_contracts_per_commodity is not None:
+            if contracts_by_commodity is not None:
+                requested_contracts = contracts_by_commodity.get(commodity, set())
+                selected = candidates.loc[candidates.contract_uid.astype(str).isin(requested_contracts)]
+                if selected.empty:
+                    raise ValueError(f"explicit selection has no {commodity} contract episodes")
+            elif max_contracts_per_commodity is not None:
                 selected = candidates.tail(max_contracts_per_commodity)
             minute_contracts = set(selected["contract_uid"].astype(str))
             lifecycle_references.update(_read_lifecycle_references(
-                root / commodity / f"{commodity}_1m.csv", commodity, candidates,
+                root / commodity / f"{commodity}_1m.csv", commodity, selected,
             ))
             frames[commodity] = {
                 "minute": _read_csv(root / commodity / f"{commodity}_1m.csv", "1m", minute_contracts),
-                # Daily/weekly stay complete because earlier contracts form commodity history.
+                # Daily/weekly stay complete because earlier same-series contracts form history.
                 "daily": _read_csv(root / commodity / f"{commodity}_1d.csv", "1d"),
                 "weekly": _read_csv(root / commodity / f"{commodity}_1w.csv", "1w"),
             }
@@ -364,10 +432,7 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
             for commodity, years in history_config["commodity_years"].items()
         }
         self.require_full_history = bool(history_config["require_full_history"])
-        bounds = {
-            commodity: reliable_weekly_bounds(scales["weekly"])
-            for commodity, scales in store.frames.items()
-        }
+        bounds = reliable_weekly_bounds_by_series(store.episode_table, store.frames)
         self.history_week_eligibility_records, self.history_week_eligibility_summary = compute_history_week_eligibility(
             store.episode_table, bounds, years=self.history_years,
             commodity_years=self.history_commodity_years,
@@ -392,6 +457,7 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
         self.daily_truncated_tokens = 0
         self.excluded_episodes: list[dict[str, str]] = []
         self._history_cache: dict[tuple[str, str, int], tuple[np.ndarray, ...]] = {}
+        self._history_row_cache: dict[tuple[str, str, int], pd.DataFrame] = {}
         self._build()
 
     @property
@@ -512,62 +578,93 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
             np.log1p(np.maximum(delta, 0)),
         )).astype(np.float32)
 
+    def history_weekly_rows(self, current: ContractEpisode) -> pd.DataFrame:
+        """Return the causal, same-lineage stitched Weekly rows used by Historical memory."""
+        if current.key in self._history_row_cache:
+            return self._history_row_cache[current.key].copy()
+        required_years = self.history_commodity_years.get(current.commodity, self.history_years)
+        cutoff = current.main_start - pd.DateOffset(years=required_years)
+        identities = pd.DataFrame([
+            {
+                "commodity": identity.commodity, "contract_uid": identity.contract_uid,
+                "delivery_year": identity.delivery_year, "delivery_month": identity.delivery_month,
+                "series_key": identity.series_key,
+            }
+            for identity in self.store.contracts.values()
+            if identity.commodity == current.commodity and identity.series_key == current.series_key
+        ])
+        weekly = self.store.frames[current.commodity]["weekly"].merge(
+            identities, on=["commodity", "contract_uid"], how="inner", validate="many_to_one",
+        ).rename(columns={"week_end_date": "period_end"})
+        weekly = weekly.loc[
+            (weekly.series_key == current.series_key)
+            & (weekly.period_end >= cutoff)
+            & (weekly.period_end < current.main_start)
+        ].copy()
+        if not weekly.empty:
+            iso = weekly.period_end.dt.isocalendar()
+            weekly["iso_year"] = iso.year.to_numpy()
+            weekly["iso_week"] = iso.week.to_numpy()
+            # Frozen software-compatible stitching rule: in an overlapping
+            # calendar week the earlier delivery-year contract wins.
+            weekly = weekly.sort_values(
+                ["iso_year", "iso_week", "delivery_year", "period_end", "contract_uid"],
+                kind="mergesort",
+            ).drop_duplicates(["iso_year", "iso_week"], keep="first")
+            weekly = weekly.sort_values(["period_end", "delivery_year"], kind="mergesort").reset_index(drop=True)
+        self._history_row_cache[current.key] = weekly
+        return weekly.copy()
+
     def _history(self, current: ContractEpisode) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if current.key in self._history_cache:
             market, context, mask, validity, boundary = self._history_cache[current.key]
             return self._scaled(market, validity), context, mask, validity, boundary
-        required_years = self.history_commodity_years.get(current.commodity, self.history_years)
-        cutoff = current.main_start - pd.DateOffset(years=required_years)
-        pieces: list[tuple[ContractEpisode, pd.DataFrame]] = []
-        candidates = self.store.episode_table.loc[
-            (self.store.episode_table.commodity == current.commodity)
-            & (pd.to_datetime(self.store.episode_table.main_start_date) < current.main_start)
-        ]
-        raw_daily = self.store.frames[current.commodity]["daily"]
-        for row in candidates.sort_values("main_start_date").itertuples(index=False):
-            episode = self.store.episodes[(current.commodity, str(row.contract_uid), int(row.episode_id))]
-            daily = raw_daily.loc[(raw_daily.contract_uid == episode.contract_uid)
-                                  & raw_daily.trading_date.between(max(cutoff, episode.main_start), min(current.main_start - pd.Timedelta(days=1), episode.main_end))]
-            weekly = _aggregate_weekly(daily)
-            if not weekly.empty:
-                weekly["contract_uid"] = episode.contract_uid
-                weekly["main_start"] = episode.main_start
-                pieces.append((episode, weekly))
-        market_parts, valid_parts, context_parts, boundary_parts = [], [], [], []
-        raw_weekly_all = self.store.frames[current.commodity]["weekly"]
-        for episode, weekly in pieces:
-            raw = raw_weekly_all.loc[raw_weekly_all.contract_uid == episode.contract_uid].rename(columns={"week_end_date": "period_end"})
-            if episode.key not in self.store.lifecycle_references:
-                raise ValueError(f"missing causal main-start minute origin for historical episode {episode.key}")
-            market, validity = _transform_lifecycle(
-                weekly, raw, "period_end", self.store.lifecycle_references[episode.key],
-                episode.main_start,
+        weekly = self.history_weekly_rows(current)
+        if not weekly.empty:
+            market = np.zeros((len(weekly), len(IMC_FEATURES)), dtype=np.float32)
+            validity = np.zeros_like(market, dtype=np.bool_)
+            ages = np.zeros(len(weekly), dtype=np.float64)
+            raw_weekly = self.store.frames[current.commodity]["weekly"].rename(
+                columns={"week_end_date": "period_end"},
             )
-            ages = ((weekly.period_end - episode.main_start).dt.days // 7).clip(lower=0).to_numpy()
+            for contract_uid, positions in weekly.groupby("contract_uid", sort=False).groups.items():
+                indices = np.asarray(list(positions), dtype=np.int64)
+                contract_rows = weekly.loc[indices].sort_values("period_end", kind="mergesort")
+                raw_contract = raw_weekly.loc[
+                    (raw_weekly.contract_uid == contract_uid)
+                    & (raw_weekly.period_end < current.main_start)
+                ].sort_values("period_end", kind="mergesort")
+                start = pd.Timestamp(contract_rows.iloc[0].period_end)
+                previous = raw_contract.loc[raw_contract.period_end < start].tail(20)
+                immediate = previous.iloc[-1] if not previous.empty else None
+                values, valid, _ = V11IMCTransform.window(
+                    contract_rows.loc[:, BAR_COLUMNS].to_numpy(dtype=np.float64),
+                    prior_volume=previous.volume.to_numpy(dtype=np.float64),
+                    previous_close=None if immediate is None else float(immediate.close),
+                    previous_oi=None if immediate is None else float(immediate.open_interest),
+                )
+                ordered_indices = contract_rows.index.to_numpy(dtype=np.int64)
+                market[ordered_indices] = values
+                validity[ordered_indices] = valid
+                contract_start = pd.Timestamp(raw_contract.iloc[0].period_end)
+                ages[ordered_indices] = (
+                    (contract_rows.period_end - contract_start).dt.days // 7
+                ).clip(lower=0).to_numpy()
             ago = ((current.main_start - weekly.period_end).dt.days // 7).clip(lower=0).to_numpy()
             context = np.column_stack((
                 np.clip(ago / 156.0, 0, 1), np.clip(ages / 64.0, 0, 1),
                 np.zeros(len(weekly)), np.zeros(len(weekly)),
-                np.clip(weekly.trading_day_count.to_numpy() / 5.0, 0, 1),
+                np.ones(len(weekly)),
             )).astype(np.float32)
-            boundary = np.zeros(len(weekly), dtype=np.float32)
-            boundary[0] = 1.0
-            market_parts.append(market); valid_parts.append(validity); context_parts.append(context); boundary_parts.append(boundary)
-        if market_parts:
-            market = np.concatenate(market_parts); validity = np.concatenate(valid_parts)
-            context = np.concatenate(context_parts); boundary = np.concatenate(boundary_parts)
-            segment_ids = np.concatenate([
-                np.full(len(weekly), f"{episode.segment_key[0]}\0{episode.segment_key[1]}", dtype=object)
-                for episode, weekly in pieces
-            ])
+            segment_ids = weekly.contract_uid.astype(str).to_numpy(dtype=object)
             if len(market) > self.history_weekly_capacity:
-                market, validity, context, boundary, segment_ids = (
+                market, validity, context, segment_ids = (
                     item[-self.history_weekly_capacity:]
-                    for item in (market, validity, context, boundary, segment_ids)
+                    for item in (market, validity, context, segment_ids)
                 )
-                boundary[:] = 0
-                boundary[0] = 1
-                boundary[1:] = (segment_ids[1:] != segment_ids[:-1]).astype(np.float32)
+            boundary = np.zeros(len(market), dtype=np.float32)
+            boundary[0] = 1.0
+            boundary[1:] = (segment_ids[1:] != segment_ids[:-1]).astype(np.float32)
         else:
             market = np.empty((0, len(IMC_FEATURES)), dtype=np.float32)
             validity = np.empty_like(market, dtype=np.bool_)
