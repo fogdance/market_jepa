@@ -50,6 +50,7 @@ DEFAULT_V11_CONFIG: dict[str, Any] = {
     },
     "history_week": {
         "years": 3,
+        "commodity_years": {"SH": 2},
         "capacity": 156,
         "require_full_history": True,
     },
@@ -132,10 +133,23 @@ def validate_v11_config(config: dict[str, Any]) -> None:
     )):
         raise ValueError("data/model capacities differ")
     history = config.get("history_week")
-    if not isinstance(history, dict) or set(history) != {"years", "capacity", "require_full_history"}:
-        raise ValueError("history_week requires years/capacity/require_full_history")
+    if not isinstance(history, dict) or set(history) != {
+        "years", "commodity_years", "capacity", "require_full_history",
+    }:
+        raise ValueError("history_week requires years/commodity_years/capacity/require_full_history")
     if isinstance(history["years"], bool) or not isinstance(history["years"], int) or history["years"] <= 0:
         raise ValueError("history_week.years must be a positive integer")
+    commodity_years = history["commodity_years"]
+    if not isinstance(commodity_years, dict):
+        raise ValueError("history_week.commodity_years must be a mapping")
+    unknown = set(commodity_years) - set((*TRAIN_COMMODITIES, HELD_OUT_COMMODITY))
+    if unknown:
+        raise ValueError(f"unknown history_week commodity override: {sorted(unknown)}")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in commodity_years.values()
+    ):
+        raise ValueError("history_week.commodity_years values must be positive integers")
     if history["capacity"] != 156 or history["capacity"] != config["model"]["history_weekly_capacity"]:
         raise ValueError("V1.1 freezes history_week.capacity=156")
     if not isinstance(history["require_full_history"], bool):

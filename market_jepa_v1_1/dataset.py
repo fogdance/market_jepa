@@ -204,6 +204,7 @@ def compute_history_week_eligibility(
     weekly_bounds: dict[str, tuple[pd.Timestamp | None, pd.Timestamp | None]],
     *,
     years: int,
+    commodity_years: dict[str, int] | None,
     require_full_history: bool,
     role: str,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -215,11 +216,12 @@ def compute_history_week_eligibility(
     commodities = sorted(set(table.commodity.astype(str)) | set(weekly_bounds))
     for commodity in commodities:
         first, last = weekly_bounds.get(commodity, (None, None))
+        required_years = int((commodity_years or {}).get(commodity, years))
         commodity_records = []
         for row in table.loc[table.commodity == commodity].sort_values("main_start_date").itertuples(index=False):
             main_start = pd.Timestamp(row.main_start_date)
             available_years = 0.0 if first is None else max(0.0, (main_start - first).days / 365.2425)
-            coverage = first is not None and main_start >= first + pd.DateOffset(years=years)
+            coverage = first is not None and main_start >= first + pd.DateOffset(years=required_years)
             eligible = bool(coverage or not require_full_history)
             reason = "" if eligible else (
                 "no_reliable_history_week" if first is None else "insufficient_history_week_coverage"
@@ -229,6 +231,7 @@ def compute_history_week_eligibility(
                 "episode_id": int(row.episode_id), "main_start": main_start.date().isoformat(),
                 "first_weekly_date": None if first is None else first.date().isoformat(),
                 "last_weekly_date": None if last is None else last.date().isoformat(),
+                "required_history_years": required_years,
                 "available_history_years": round(available_years, 6),
                 "eligible": eligible, "filter_reason": reason,
             }
@@ -244,6 +247,7 @@ def compute_history_week_eligibility(
         summaries[commodity] = {
             "first_weekly_date": None if first is None else first.date().isoformat(),
             "last_weekly_date": None if last is None else last.date().isoformat(),
+            "required_history_years": required_years,
             "total_contract_count": len(commodity_records),
             "filtered_insufficient_history_count": len(commodity_records) - len(eligible_records),
             "eligible_contract_count": len(eligible_records),
@@ -355,6 +359,10 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
         history_config = config["history_week"]
         self.history_weekly_capacity = int(history_config["capacity"])
         self.history_years = int(history_config["years"])
+        self.history_commodity_years = {
+            str(commodity): int(years)
+            for commodity, years in history_config["commodity_years"].items()
+        }
         self.require_full_history = bool(history_config["require_full_history"])
         bounds = {
             commodity: reliable_weekly_bounds(scales["weekly"])
@@ -362,6 +370,7 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
         }
         self.history_week_eligibility_records, self.history_week_eligibility_summary = compute_history_week_eligibility(
             store.episode_table, bounds, years=self.history_years,
+            commodity_years=self.history_commodity_years,
             require_full_history=self.require_full_history, role=role,
         )
         eligible_keys = {
@@ -507,7 +516,8 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
         if current.key in self._history_cache:
             market, context, mask, validity, boundary = self._history_cache[current.key]
             return self._scaled(market, validity), context, mask, validity, boundary
-        cutoff = current.main_start - pd.DateOffset(years=self.history_years)
+        required_years = self.history_commodity_years.get(current.commodity, self.history_years)
+        cutoff = current.main_start - pd.DateOffset(years=required_years)
         pieces: list[tuple[ContractEpisode, pd.DataFrame]] = []
         candidates = self.store.episode_table.loc[
             (self.store.episode_table.commodity == current.commodity)

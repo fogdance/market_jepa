@@ -649,6 +649,8 @@ def test_v11_contract_filtered_if_history_shorter_than_config():
 
 
 def test_v11_history_years_is_configurable():
+    assert DEFAULT_V11_CONFIG["history_week"]["years"] == 3
+    assert DEFAULT_V11_CONFIG["history_week"]["commodity_years"] == {"SH": 2}
     formal_two_years = deepcopy(DEFAULT_V11_CONFIG)
     formal_two_years["history_week"]["years"] = 2
     validate_v11_config(formal_two_years)
@@ -663,18 +665,23 @@ def test_v11_late_listed_commodity_uses_own_history_start():
     store = _prepend_reliable_week(
         _make_store(("FG", "SH")), {"FG": "2018-01-05", "SH": "2021-01-08"},
     )
-    config = _dataset_config(); config["history_week"].update(years=3, require_full_history=True)
+    config = _dataset_config(); config["history_week"].update(
+        years=3, commodity_years={"SH": 1}, require_full_history=True,
+    )
     dataset = V11ContractDataset(store, config)
     assert dataset.history_week_eligibility_summary["FG"]["eligible_contract_count"] == 3
-    assert dataset.history_week_eligibility_summary["SH"]["eligible_contract_count"] == 0
-    assert dataset.history_week_eligibility_summary["SH"]["reason"] == "insufficient history_week coverage"
+    assert dataset.history_week_eligibility_summary["FG"]["required_history_years"] == 3
+    assert dataset.history_week_eligibility_summary["SH"]["eligible_contract_count"] == 2
+    assert dataset.history_week_eligibility_summary["SH"]["required_history_years"] == 1
 
 
 def test_v11_sampler_never_selects_ineligible_contract():
     store = _prepend_reliable_week(
         _make_store(TRAIN_COMMODITIES), {commodity: "2019-03-01" for commodity in TRAIN_COMMODITIES},
     )
-    config = _dataset_config(); config["history_week"].update(years=3, require_full_history=True)
+    config = _dataset_config(); config["history_week"].update(
+        years=3, commodity_years={}, require_full_history=True,
+    )
     dataset = V11ContractDataset(store, config)
     sampler = HierarchicalCommodityContractSampler(dataset, 10_000, seed=29)
     for index in sampler:

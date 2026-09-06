@@ -322,6 +322,7 @@ def audit_history_week_eligibility(root: Path, config: dict, output: Path) -> di
     history = config["history_week"]
     records, summaries = compute_history_week_eligibility(
         episodes, bounds, years=int(history["years"]),
+        commodity_years={str(key): int(value) for key, value in history["commodity_years"].items()},
         require_full_history=bool(history["require_full_history"]), role="train",
     )
     order = {commodity: index for index, commodity in enumerate(TRAIN_COMMODITIES)}
@@ -565,6 +566,11 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
     blocker_text = ", ".join(
         f"{item['commodity']}: {item['reason']}" for item in eligibility["blockers"]
     ) or "NONE"
+    scaler_text = (
+        "Shared scaler fitted by FG/SA/JM/SH/SP only: YES."
+        if production["status"] == "PASS"
+        else "Shared scaler fitter requires FG/SA/JM/SH/SP only; fit did not run because eligibility was blocked."
+    )
     self_review = [
         f"V0 regression-safe: {'YES' if v0_safe and test_result['status'] == 'PASS' else 'NO'}. Manifest {current_v0}.",
         "V1.0 dead terminal feedback removed: YES; JEPA backward gradient hard test passes.",
@@ -579,7 +585,7 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
         "Future targets share the online fixed origin: YES, exact identity test.",
         "Future target is market-only: YES.",
         "Commodity embedding/ID shortcut exists: NO.",
-        "Shared scaler fitter requires FG/SA/JM/SH/SP only; current formal fit was not run because eligibility blocked SH.",
+        scaler_text,
         "RB participated in fitting: NO.",
         "Sampler is Commodity -> Contract -> Anchor: YES.",
         "Intended online parameters with grad=None: NONE.",

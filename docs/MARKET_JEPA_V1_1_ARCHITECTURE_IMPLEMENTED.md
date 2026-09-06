@@ -55,11 +55,13 @@ Before anchors are built, the dataset precomputes `eligible_contracts_by_commodi
 ```yaml
 history_week:
   years: 3
+  commodity_years:
+    SH: 2
   capacity: 156
   require_full_history: true
 ```
 
-For each commodity independently, the first reliable Weekly row defines the coverage origin. An episode is eligible exactly when `main_start >= first_weekly_date + 3 calendar years`. Capacity is not used as a proxy for coverage: an early contract cannot enter training with mostly PAD, while genuine missing weeks inside an eligible three-year calendar window remain PAD plus mask. Sampling receives only this prefiltered contract population and never retries an ineligible draw.
+For each commodity independently, the first reliable Weekly row defines the coverage origin. An episode is eligible exactly when `main_start >= first_weekly_date + required_years`, where `required_years` is its explicit commodity override or the global default. Capacity is not used as a proxy for coverage: an early contract cannot enter training with mostly PAD, while genuine missing weeks inside an eligible configured calendar window remain PAD plus mask. Sampling receives only this prefiltered contract population and never retries an ineligible draw. The override is data eligibility/window configuration only; commodity identity remains absent from model construction and forward representation.
 
 ## Tensor and mask contract
 
@@ -135,18 +137,18 @@ V1.1 is 1.766843× V0, below the 3× stop threshold.
 
 Production integration uses `/data/jepa/v1_1_raw`. All six commodities have real-contract 1m/1d/1w files and the episode calendar. Existing source audit findings are handled explicitly: missing contracts are excluded, missing warmup becomes invalid coordinates, anchors use observed same-contract rows, and extra post-anchor rows never enter online memory. The development hard gate scans every Train minute row for Price/OI/Volume/OHLC validity and contract coverage, verifies every available minute→Daily cache row, and verifies every Daily→Weekly cache row. Nonpositive OI is not silently accepted: its IMC validity is false. Detailed evidence is in `artifacts/evaluation/v1_1_architecture_development/data_contract_report.json`.
 
-The three-year eligibility audit over the supplied production package is:
+The configured eligibility audit over the supplied production package is:
 
-| Commodity | First reliable Weekly | Total episodes | Filtered | Eligible | Earliest eligible episode | Earliest eligible main-start |
-|---|---:|---:|---:|---:|---|---:|
-| FG | 2017-12-22 | 33 | 16 | 17 | FG202109 | 2021-04-08 |
-| SA | 2019-12-06 | 21 | 10 | 11 | SA202309 | 2023-03-27 |
-| JM | 2017-12-29 | 38 | 21 | 17 | JM202109 | 2021-04-21 |
-| SH | 2023-09-15 | 12 | 12 | 0 | — | — |
-| SP | 2018-11-30 | 34 | 16 | 18 | SP202205 | 2021-12-16 |
+| Commodity | Required years | First reliable Weekly | Total episodes | Filtered | Eligible | Earliest eligible episode | Earliest eligible main-start |
+|---|---:|---:|---:|---:|---:|---|---:|
+| FG | 3 | 2017-12-22 | 33 | 16 | 17 | FG202109 | 2021-04-08 |
+| SA | 3 | 2019-12-06 | 21 | 10 | 11 | SA202309 | 2023-03-27 |
+| JM | 3 | 2017-12-29 | 38 | 21 | 17 | JM202109 | 2021-04-21 |
+| SH | 2 | 2023-09-15 | 12 | 7 | 5 | SH202603 | 2025-12-11 |
+| SP | 3 | 2018-11-30 | 34 | 16 | 18 | SP202205 | 2021-12-16 |
 
-Therefore the architecture code passes, but formal five-commodity training is data-blocked: SH has no episode with three full calendar years of its own reliable Weekly history. The implementation neither reduces `years` nor silently excludes SH from the commodity-uniform benchmark. Per-contract evidence is written to `history_week_eligibility.csv` and `history_week_eligibility.json` in the development artifact directory.
+Every formal Train commodity now has a nonempty eligible population. The implementation does not silently alter either the global default or the SH override and does not exclude a missing commodity from the uniform benchmark. Per-contract evidence, including each episode's `required_history_years`, is written to `history_week_eligibility.csv` and `history_week_eligibility.json` in the development artifact directory.
 
 ## Deviations from the frozen design
 
-There are no theory or architecture deviations. Because SH currently has zero eligible episodes, the updated hard gate does not run the five-commodity shared-scaler fit or the 100-step production-data smoke and does not create a formal checkpoint. Realistic-capacity synthetic B=2/B=8 architecture smoke remains valid code verification. No RB data is used for fitting. RB validation/test should remain one held-out role with time/anchor splits; independently, historical visibility is causal by timestamp and does not discard earlier episodes merely because a role label differs.
+There are no theory or architecture deviations. The configured SH eligibility window is two calendar years while every unlisted commodity inherits the three-year default; all retain capacity 156 and explicit PAD/mask semantics. The development smoke limits loaded current-minute episodes to one recent eligible episode per Train commodity to bound runtime; it is not a formal benchmark run. No RB data is used for fitting. RB validation/test should remain one held-out role with time/anchor splits; independently, historical visibility is causal by timestamp and does not discard earlier episodes merely because a role label differs.

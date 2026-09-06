@@ -11,6 +11,8 @@ data:
   anchor_stride: 1
 history_week:
   years: 3
+  commodity_years:
+    SH: 2
   capacity: 156
   require_full_history: true
 model:
