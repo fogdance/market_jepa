@@ -53,9 +53,9 @@ All six feature dimensions are config-controlled. Tests also use seven market co
 
 **Padding:** valid GRU steps are stably compacted, packed, then scattered back to their original token positions. Left, right and interior padding are supported. Padded input values are zeroed before projection/GRU, padded keys are excluded from attention, and padded output tokens are zeroed after local encoders and feedback. Minute positions count valid tokens, making padding placement irrelevant to valid representations. Daily/Weekly may be wholly absent, including zero-length sequences; minute histories must contain at least one valid observation per sample. NaN/Inf in valid input tokens raises an error; NaN padding is excluded. The local minute Transformer has bidirectional historical attention, consistent with V0: all observation tokens are already known at the anchor.
 
-## Two complete cross-scale rounds and final belief
+## Two State reads, one useful feedback, and final belief
 
-Each of the two independently parameterized `CrossScaleInteractionBlock` instances executes:
+The first `CrossScaleInteractionBlock` executes the complete bidirectional update:
 
 ```text
 S = S + MHA(LN(S), LN(T), LN(T), key_padding_mask=T_mask)
@@ -64,11 +64,11 @@ T = T + MHA(LN(T), LN(S), LN(S))
 T = T + FFN(LN(T))
 ```
 
-Feedback attention/FFN are shared across minute, Daily and Weekly tokens within a round. Cross-scale attention has K×N and N×K query-key interactions, where K=8 and N=M+1+D+W; there is no N×N all-scale attention. Minute local attention retains its existing quadratic local cost.
+The second block executes only `State <- Tokens` and its State FFN. Its former terminal `Tokens <- State` output had no path to belief or JEPA loss and has been removed. Feedback attention/FFN are shared across minute, Daily and Weekly tokens within the useful first round. Cross-scale attention has K×N and N×K query-key interactions, where K=8 and N=M+1+D+W; there is no N×N all-scale attention. Minute local attention retains its existing quadratic local cost.
 
 After round 1, minute tokens contain information from Daily and Weekly through shared State. Round 2 reads these conditioned minute tokens. Final belief is `Linear(256→256)(LayerNorm(S_round2[:,0]))`; there is no 544-dimensional branch-vector fusion.
 
-The user explicitly selected **two complete bidirectional rounds**. Consequently round-2 feedback executes, but its resulting T has no downstream use in the current loss. Its 790,272 parameters have `requires_grad=True` yet receive no JEPA gradient, and are included in the trainable count. This is an explicit limitation of the frozen topology, verified by perturbing terminal-feedback weights and observing unchanged belief but changed terminal tokens. No extra read, hidden parameter sharing, auxiliary loss or objective was added to train that terminal branch.
+Every intended online trainable parameter now participates in the real JEPA backward path. The change removes 790,272 dead parameters without changing the numerically relevant belief computation.
 
 `cross_scale_rounds=0` is allowed only with `debug=True` and a debug config. It constructs no blocks and uses the minute CLS through the belief head; it is a bypass diagnostic, not a claimed scientific ablation. Formal configs enforce two rounds and all specified capacity settings.
 
@@ -90,14 +90,14 @@ Counts exclude EMA from trainable totals and use the existing 14/5/14/1/14/1 fea
 | Minute context branch/projection | 3,744 | 1,280 |
 | Daily encoder including projection/scale | 154,752 | 188,032 |
 | Weekly encoder including projection/scale | 154,752 | 188,032 |
-| Cross-scale blocks (two) | 0 | 3,161,088 |
+| Cross-scale blocks (two State reads, one feedback) | 0 | 2,370,816 |
 | Learned state tokens | 0 | 2,048 |
 | Fusion / belief head | 410,880 | 66,304 |
 | Three predictors | 788,736 | 788,736 |
-| **Trainable total** | **4,676,512** | **7,559,424** |
+| **Trainable total** | **4,676,512** | **6,769,152** |
 | EMA, separately | 3,163,648 | 3,163,904 |
 
-Difference: **2,882,912**, ratio **1.6164662894**. The >3× stop threshold is checked automatically. V1 trainable parameters with a connected loss path total 6,769,152 after subtracting terminal feedback; the primary report still uses all requires_grad parameters, as requested.
+Difference: **2,092,640**, ratio **1.4474788047**. The >3× stop threshold is checked automatically, and the full trainable count has a connected JEPA loss path.
 
 ## Debug API and validation
 
@@ -111,6 +111,8 @@ final_belief, token_lengths, token_padding_mask
 ```
 
 These tensors are attached to the current graph so callers may retain gradients for audits. Default forward creates no debug dictionary, and modules do not retain intermediate tensors across calls. Attention weights are not returned or interpreted as causal importance. Evidence comes from controlled interventions, feedback removal, source-history integrity checks and gradients.
+
+V1.1 review correction: the second-round terminal token-feedback submodule had no path to the JEPA loss. It is no longer instantiated, leaving the numerically relevant `State <- Tokens` update intact. `V1Trainer` also always uses `fixed_budget_final`; validation remains diagnostic and cannot create `best.pt`.
 
 Targeted tests verify that changing only Daily, Weekly or minute context changes belief; only context changes the local minute representation before cross-scale interaction. Both higher scales change non-CLS minute tokens at the actual input to round 2. Removing first-round feedback removes that effect. The loss B.sum() reaches every valid intermediate period token, non-CLS minute tokens, minute context projection and all learned state slots. Tests also verify future-context invariance of targets, target/persistence horizon contracts, zero-round bypass, padding invariance, GRU causality, strict checkpoint failures, exact resumed model/optimizer trajectory, synthetic evaluation metrics and unchanged V0 manifest/counts.
 

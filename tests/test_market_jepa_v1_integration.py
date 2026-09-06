@@ -122,6 +122,7 @@ def test_market_jepa_v1_evaluation_compatibility_on_synthetic_only(integration):
     base = MarketDataset(data, config, "validation")
     validation = MarketDataset(data, config, "validation", base.indices[:2])
     trainer = trainer_for(config, train, validation)
+    assert trainer.checkpoint_selection == "fixed_budget_final"
     result = trainer._epoch(trainer.validation_loader, training=False)
     assert np.isfinite(result["prediction_loss_h64"])
     assert trainer.global_step == 0

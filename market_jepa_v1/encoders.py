@@ -101,19 +101,21 @@ class PeriodSequenceEncoder(nn.Module):
 class CrossScaleInteractionBlock(nn.Module):
     """One complete State←T, T←State round; feedback is shared across scales."""
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, *, feedback: bool = True) -> None:
         super().__init__()
+        self.has_feedback = feedback
         dim, heads, dropout = config["d_model"], config["num_heads"], config["dropout"]
         self.state_query_norm = nn.LayerNorm(dim)
         self.token_key_norm = nn.LayerNorm(dim)
         self.state_attention = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
         self.state_ffn_norm = nn.LayerNorm(dim)
         self.state_ffn = self._ffn(dim, config["ffn_dim"], dropout)
-        self.token_query_norm = nn.LayerNorm(dim)
-        self.state_key_norm = nn.LayerNorm(dim)
-        self.feedback_attention = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
-        self.feedback_ffn_norm = nn.LayerNorm(dim)
-        self.feedback_ffn = self._ffn(dim, config["ffn_dim"], dropout)
+        if feedback:
+            self.token_query_norm = nn.LayerNorm(dim)
+            self.state_key_norm = nn.LayerNorm(dim)
+            self.feedback_attention = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+            self.feedback_ffn_norm = nn.LayerNorm(dim)
+            self.feedback_ffn = self._ffn(dim, config["ffn_dim"], dropout)
 
     @staticmethod
     def _ffn(dim: int, hidden: int, dropout: float) -> nn.Sequential:
@@ -125,9 +127,10 @@ class CrossScaleInteractionBlock(nn.Module):
         state = state + self.state_attention(self.state_query_norm(state), keys, keys,
                                              key_padding_mask=mask, need_weights=False)[0]
         state = state + self.state_ffn(self.state_ffn_norm(state))
-        keys = self.state_key_norm(state)
-        tokens = tokens + self.feedback_attention(self.token_query_norm(tokens), keys, keys, need_weights=False)[0]
-        tokens = tokens + self.feedback_ffn(self.feedback_ffn_norm(tokens))
+        if self.has_feedback:
+            keys = self.state_key_norm(state)
+            tokens = tokens + self.feedback_attention(self.token_query_norm(tokens), keys, keys, need_weights=False)[0]
+            tokens = tokens + self.feedback_ffn(self.feedback_ffn_norm(tokens))
         return state, tokens.masked_fill(mask.unsqueeze(-1), 0)
 
 
@@ -146,7 +149,11 @@ class CrossScaleStateEncoder(nn.Module):
             ))
         self.state_tokens = nn.Parameter(torch.empty(1, config["num_state_tokens"], config["d_model"]))
         nn.init.normal_(self.state_tokens, std=0.02)
-        self.blocks = nn.ModuleList(CrossScaleInteractionBlock(config) for _ in range(config["cross_scale_rounds"]))
+        rounds = config["cross_scale_rounds"]
+        self.blocks = nn.ModuleList(
+            CrossScaleInteractionBlock(config, feedback=index + 1 < rounds)
+            for index in range(rounds)
+        )
         self.belief_head = nn.Sequential(nn.LayerNorm(config["d_model"]), nn.Linear(config["d_model"], config["belief_dim"]))
 
     def forward(self, batch: dict, *, return_intermediates: bool = False):

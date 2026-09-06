@@ -1,0 +1,63 @@
+design_version: "1.1"
+experiment_id: market_jepa_v1_1_development
+data:
+  root: /data/jepa/v1_1_raw
+  train_commodities: [FG, SA, JM, SH, SP]
+  held_out_commodity: RB
+  minute_capacity: 512
+  daily_capacity: 256
+  current_weekly_capacity: 64
+  history_weekly_capacity: 156
+  history_years: 3
+  horizons: [16, 64, 256]
+  anchor_stride: 1
+model:
+  minute_market_dim: 9
+  minute_context_dim: 5
+  daily_market_dim: 9
+  daily_context_dim: 5
+  current_weekly_market_dim: 9
+  current_weekly_context_dim: 5
+  history_weekly_market_dim: 9
+  history_weekly_context_dim: 5
+  d_model: 256
+  num_heads: 8
+  ffn_dim: 1024
+  minute_layers: 4
+  minute_capacity: 512
+  daily_capacity: 256
+  current_weekly_capacity: 64
+  history_weekly_capacity: 156
+  commodity_state_tokens: 4
+  contract_state_tokens: 4
+  belief_tokens: 8
+  belief_dim: 256
+  predictor_hidden: 512
+  dropout: 0.1
+  commodity_embedding: false
+training:
+  seed: 42
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  batch_size: 64
+  gradient_accumulation: 2
+  max_epochs: 50
+  warmup_ratio: 0.05
+  scheduler: cosine
+  gradient_clip_norm: 1.0
+  ema_tau: 0.996
+  amp: true
+  lambda_var: 0.0
+  lambda_cov: 0.0
+  variance_floor: 1.0
+  collapse_threshold: 0.05
+  num_workers: 0
+  checkpoint_dir: artifacts/checkpoints/v1_1
+development:
+  optimizer_steps: 100
+  batch_size: 2
+  scaler_anchors_per_commodity: 32
+  anchors_per_contract: 16

@@ -170,24 +170,14 @@ def test_market_jepa_v1_gradients(v1_model, v1_batch):
         assert (grad[~mask].abs().sum(-1) > 0).all()
 
 
-def test_market_jepa_v1_terminal_feedback_executes_without_loss_gradient(v1_model, v1_batch):
-    calls = []
-    handle = v1_model.online.blocks[1].feedback_attention.register_forward_hook(lambda *_: calls.append(True))
-    try:
-        output = v1_model(v1_batch, return_intermediates=True)
-        output["z_market"].sum().backward()
-    finally:
-        handle.remove()
-    assert calls == [True]
+def test_market_jepa_v1_terminal_feedback_removed_and_all_parameters_connected(v1_model, v1_batch):
+    output = v1_model(v1_batch)
+    loss, _ = jepa_loss(output)
+    loss.backward()
     terminal = v1_model.online.blocks[1]
-    assert all(p.grad is None for p in terminal.feedback_attention.parameters())
-    assert all(p.grad is None for p in terminal.feedback_ffn.parameters())
-    with torch.no_grad():
-        before = v1_model(v1_batch, return_intermediates=True)
-        terminal.feedback_ffn[-2].bias.add_(2)
-        after = v1_model(v1_batch, return_intermediates=True)
-    torch.testing.assert_close(before["z_market"], after["z_market"], rtol=0, atol=0)
-    assert not torch.equal(before["intermediates"]["tokens_after_feedback_round_2"], after["intermediates"]["tokens_after_feedback_round_2"])
+    assert not terminal.has_feedback and not hasattr(terminal, "feedback_attention")
+    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
+               for parameter in v1_model.optimizer_parameters())
 
 
 def test_market_jepa_v1_zero_rounds_is_explicit_debug(v1_config, v1_batch):

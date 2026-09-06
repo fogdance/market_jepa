@@ -303,7 +303,7 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, ru
                "cuda_smoke_status": smoke["cuda_smoke_status"], "real_data_smoke_status": smoke["real_data"]["status"],
                "formal_benchmark_started": False, "formal_imc_benchmark_ready": False,
                "limitations": ["IMC-compatible tensor contract; production multiscale IMC preprocessing/benchmark remains upstream.",
-                               "Terminal round-2 feedback is executed but does not affect belief or JEPA loss (user-confirmed).",
+                               "Terminal round-2 feedback was removed because it had no path to belief or JEPA loss.",
                                "Attention weights are not causal importance; audits use interventions and gradients."]}
     if smoke["cuda_smoke_status"] != "PASS":
         summary["limitations"].append(f"CUDA smoke not verified in this execution environment: {cuda_error}")

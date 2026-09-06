@@ -33,7 +33,7 @@ class V1Trainer(Trainer):
             validation_dataset = MarketDataset(train_dataset.data, train_dataset.config, "train", np.empty(0, dtype=np.int64))
         super().__init__(model, trainer_config, train_dataset, validation_dataset, source_sha256,
                          preflight_metadata, device, runtime_options,
-                         checkpoint_selection="validation_h64" if evaluate else "fixed_budget_final",
+                         checkpoint_selection="fixed_budget_final",
                          evaluate_validation_during_training=evaluate)
         self.v1_manifest = v1_implementation_manifest()
         self.v1_digest = manifest_sha256(self.v1_manifest)
