@@ -62,7 +62,7 @@ def _git_state() -> tuple[str, bool]:
         text=True, capture_output=True,
     ).stdout.strip()
     dirty = bool(subprocess.run(
-        ["git", "status", "--porcelain"], cwd=root, check=True,
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=root, check=True,
         text=True, capture_output=True,
     ).stdout.strip())
     return commit, dirty
@@ -275,7 +275,7 @@ def run_formal_training(
     protocol = {
         "design_version": "1.1",
         "git_commit": git_commit,
-        "git_worktree_dirty_at_start": git_dirty,
+        "git_tracked_worktree_dirty_at_start": git_dirty,
         "config_sha256": config_sha256,
         "implementation_sha256": implementation_sha256,
         "data_build_manifest_sha256": data_manifest_sha256,
