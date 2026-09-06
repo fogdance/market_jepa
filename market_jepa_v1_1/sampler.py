@@ -1,24 +1,29 @@
 from __future__ import annotations
 
+from typing import Iterable
+
 import numpy as np
 from torch.utils.data import Sampler
 
-from .config import TRAIN_COMMODITIES
 from .dataset import V11ContractDataset
 
 
 class HierarchicalCommodityContractSampler(Sampler[int]):
     """Deterministic uniform Commodity -> Contract -> Anchor sampling."""
 
-    def __init__(self, dataset: V11ContractDataset, num_samples: int, seed: int) -> None:
+    def __init__(
+        self, dataset: V11ContractDataset, num_samples: int, seed: int,
+        commodities: Iterable[str] | None = None,
+    ) -> None:
         if num_samples <= 0:
             raise ValueError("num_samples must be positive")
         self.dataset, self.num_samples, self.seed = dataset, int(num_samples), int(seed)
         self.epoch = 0
         hierarchy = dataset.hierarchy
-        self.commodities = tuple(c for c in TRAIN_COMMODITIES if c in hierarchy)
-        if tuple(self.commodities) != TRAIN_COMMODITIES:
-            missing = set(TRAIN_COMMODITIES) - set(self.commodities)
+        configured = tuple(commodities) if commodities is not None else dataset.train_commodities
+        self.commodities = tuple(c for c in configured if c in hierarchy)
+        if self.commodities != configured:
+            missing = set(configured) - set(self.commodities)
             raise ValueError(f"balanced sampler is missing train commodities: {sorted(missing)}")
         self.episodes = {commodity: tuple(hierarchy[commodity]) for commodity in self.commodities}
         if any(not values for values in self.episodes.values()):

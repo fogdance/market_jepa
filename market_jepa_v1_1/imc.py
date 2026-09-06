@@ -159,14 +159,23 @@ class SharedIMCScaler:
     def fit(
         cls,
         population: Iterable[tuple[str, str, np.ndarray, np.ndarray]],
+        *,
+        expected_commodities: Iterable[str] = TRAIN_COMMODITIES,
+        held_out_commodity: str = HELD_OUT_COMMODITY,
     ) -> "SharedIMCScaler":
+        expected = tuple(str(value) for value in expected_commodities)
+        if (
+            not expected or any(not value for value in expected)
+            or len(set(expected)) != len(expected) or held_out_commodity in expected
+        ):
+            raise ValueError("invalid shared scaler Train/held-out commodity configuration")
         count = np.zeros(len(IMC_FEATURES), dtype=np.int64)
         total = np.zeros(len(IMC_FEATURES), dtype=np.float64)
         total_sq = np.zeros(len(IMC_FEATURES), dtype=np.float64)
         commodities: set[str] = set()
         source_counts: dict[str, int] = {}
         for commodity, source, values, validity in population:
-            if commodity == HELD_OUT_COMMODITY or commodity not in TRAIN_COMMODITIES:
+            if commodity == held_out_commodity or commodity not in expected:
                 raise ValueError(f"scaler fit population contains forbidden commodity {commodity}")
             values = np.asarray(values, dtype=np.float64)
             validity = np.asarray(validity, dtype=np.bool_)
@@ -181,9 +190,9 @@ class SharedIMCScaler:
             total_sq += (safe * safe).sum(axis=0)
             commodities.add(commodity)
             source_counts[source] = source_counts.get(source, 0) + int(mask.sum())
-        if commodities != set(TRAIN_COMMODITIES):
-            missing = set(TRAIN_COMMODITIES) - commodities
-            raise ValueError(f"shared scaler fit must include all Train commodities; missing={sorted(missing)}")
+        if commodities != set(expected):
+            missing = set(expected) - commodities
+            raise ValueError(f"shared scaler fit must include every configured Train commodity; missing={sorted(missing)}")
         if np.any(count == 0):
             raise ValueError("shared scaler population is empty for a commodity or feature")
         mean = total / count
@@ -232,8 +241,6 @@ class SharedIMCScaler:
         )
         if scaler.feature_order != IMC_FEATURES or scaler.compute_checksum() != scaler.checksum:
             raise ValueError("shared scaler feature order/checksum mismatch")
-        if HELD_OUT_COMMODITY in scaler.fitted_commodities:
-            raise ValueError("RB must not fit the shared scaler")
-        if set(scaler.fitted_commodities) != set(TRAIN_COMMODITIES):
-            raise ValueError("shared scaler must have been fitted by all five Train commodities")
+        if not scaler.fitted_commodities or len(set(scaler.fitted_commodities)) != len(scaler.fitted_commodities):
+            raise ValueError("shared scaler fitted commodity population is invalid")
         return scaler

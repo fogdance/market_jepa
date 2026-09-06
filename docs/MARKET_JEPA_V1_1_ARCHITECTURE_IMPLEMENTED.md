@@ -6,6 +6,22 @@ V1.1 is implemented as a separate `market_jepa_v1_1` package. V0/design 0.6.1 so
 
 This implementation stage does not start the formal 50-epoch run or RB evaluation.
 
+The separate formal entrypoint is `train_market_jepa_v1_1.py`; the development
+entrypoint remains bounded smoke only. Formal training runs all Train-only data
+hard gates, loads every eligible FG/SA/JM/SH/SP episode, fits one deterministic
+shared scaler, rebuilds a new scaled dataset, and uses the hierarchical sampler
+for exactly 50 epochs. It writes only `last.pt` under
+`artifacts/training/v1_1_formal/checkpoints`, supports strict `--resume`, and
+never constructs a validation loader or opens an RB bar file.
+
+The commodity population is read from `data.train_commodities`, and the held-out
+commodity from `data.held_out_commodity`; dataset eligibility, audits, shared
+scaler validation and hierarchical sampling all use those configured values.
+The current frozen run remains FG/SA/JM/SH/SP with RB held out. Newly configured
+commodities inherit `history_week.years=3` unless they receive an explicit
+`history_week.commodity_years` override; `SH: 2` is an intentional current-run
+override rather than a fallback.
+
 ## Actual hierarchy
 
 ```text

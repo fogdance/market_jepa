@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch.utils.data import DataLoader
@@ -77,7 +78,10 @@ class V11Trainer:
         self.accumulation = int(training["gradient_accumulation"])
         batch_size = int(training["batch_size"])
         samples = int(samples_per_epoch or len(train_dataset))
-        self.sampler = HierarchicalCommodityContractSampler(train_dataset, samples, int(training["seed"]))
+        self.sampler = HierarchicalCommodityContractSampler(
+            train_dataset, samples, int(training["seed"]),
+            commodities=config["data"]["train_commodities"],
+        )
         self.train_loader = DataLoader(
             train_dataset, batch_size=batch_size, sampler=self.sampler,
             collate_fn=collate_v11_batch, num_workers=int(training["num_workers"]),
@@ -215,18 +219,53 @@ class V11Trainer:
             "history": self.history, "gradient_connectivity": self.gradient_connectivity,
         }
 
-    def fit(self, stop_before_epoch: int | None = None) -> list[dict]:
+    def fit(
+        self, stop_before_epoch: int | None = None,
+        *, epoch_callback: Callable[[dict], None] | None = None,
+    ) -> list[dict]:
         final_epoch = int(self.config["training"]["max_epochs"])
         if stop_before_epoch is not None:
             final_epoch = int(stop_before_epoch)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         for epoch in range(self.start_epoch, final_epoch):
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+            started = time.perf_counter()
+            global_step_before = self.global_step
+            skipped_before = self.skipped_optimizer_steps
             self.sampler.set_epoch(epoch)
             train = self._run_epoch(self.train_loader, True)
             validation = None if self.validation_loader is None else self._run_epoch(self.validation_loader, False)
-            self.history.append({"epoch": epoch, "train": train, "validation": validation})
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            record = {
+                "epoch": epoch, "train": train, "validation": validation,
+                "train_loss": train["loss"],
+                **{
+                    f"prediction_loss_h{horizon}": train[f"prediction_loss_h{horizon}"]
+                    for horizon in self.model.horizons
+                },
+                "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
+                "global_step": self.global_step,
+                "optimizer_steps_this_epoch": self.global_step - global_step_before,
+                "skipped_amp_steps": self.skipped_optimizer_steps - skipped_before,
+                "elapsed_seconds": time.perf_counter() - started,
+                "peak_vram_allocated": (
+                    int(torch.cuda.max_memory_allocated()) if self.device.type == "cuda" else None
+                ),
+                "peak_vram_reserved": (
+                    int(torch.cuda.max_memory_reserved()) if self.device.type == "cuda" else None
+                ),
+            }
+            self.history.append(record)
             save_checkpoint(self._state(epoch), self.checkpoint_dir / "last.pt")
-            (self.checkpoint_dir / "history.json").write_text(json.dumps(self.history, indent=2), encoding="utf-8")
+            history_path = self.checkpoint_dir / "history.json"
+            history_temporary = history_path.with_suffix(".json.tmp")
+            history_temporary.write_text(json.dumps(self.history, indent=2), encoding="utf-8")
+            history_temporary.replace(history_path)
+            if epoch_callback is not None:
+                epoch_callback(deepcopy(record))
         return self.history
 
     def resume(self, state: dict) -> None:

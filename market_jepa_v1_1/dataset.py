@@ -418,6 +418,8 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
 
     def __init__(self, store: V11DataStore, config: dict, *, role: str = "train", scaler: SharedIMCScaler | None = None) -> None:
         self.store, self.config, self.role, self._scaler = store, config, role, None
+        self.train_commodities = tuple(str(value) for value in config["data"]["train_commodities"])
+        self.held_out_commodity = str(config["data"]["held_out_commodity"])
         if scaler is not None:
             self.set_scaler(scaler)
         self.horizons = tuple(int(x) for x in config["data"]["horizons"])
@@ -467,10 +469,14 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
     def set_scaler(self, scaler: SharedIMCScaler) -> None:
         if not isinstance(scaler, SharedIMCScaler):
             raise TypeError("scaler must be SharedIMCScaler")
-        SharedIMCScaler.from_dict(scaler.to_dict())
+        restored = SharedIMCScaler.from_dict(scaler.to_dict())
+        if set(restored.fitted_commodities) != set(self.train_commodities):
+            raise ValueError("shared scaler commodities differ from configured Train commodities")
+        if self.held_out_commodity in restored.fitted_commodities:
+            raise ValueError("held-out commodity cannot be present in the shared scaler")
         # History cache is raw by contract, so attaching a scaler cannot leave
         # stale scaled/unscaled history behind.
-        self._scaler = scaler
+        self._scaler = restored
 
     def _build(self) -> None:
         stride, max_horizon = int(self.config["data"]["anchor_stride"]), max(self.horizons)
@@ -842,7 +848,7 @@ def fit_v11_shared_scaler(
     if anchors_per_commodity <= 0:
         raise ValueError("anchors_per_commodity must be positive")
     population: list[tuple[str, str, np.ndarray, np.ndarray]] = []
-    for commodity in TRAIN_COMMODITIES:
+    for commodity in dataset.train_commodities:
         episode_indices = dataset.hierarchy.get(commodity, [])
         candidates = [
             dataset.global_index(episode_index, local)
@@ -862,4 +868,8 @@ def fit_v11_shared_scaler(
                     sample[f"{source}_market"].numpy(),
                     sample[f"{source}_imc_validity"].numpy(),
                 ))
-    return SharedIMCScaler.fit(population)
+    return SharedIMCScaler.fit(
+        population,
+        expected_commodities=dataset.train_commodities,
+        held_out_commodity=dataset.held_out_commodity,
+    )

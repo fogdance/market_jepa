@@ -118,10 +118,16 @@ def validate_v11_config(config: dict[str, Any]) -> None:
         raise ValueError('V1.1 requires design_version="1.1"')
     validate_model_config(config["model"], debug=config.get("profile") == "debug")
     data = config["data"]
-    if tuple(data["train_commodities"]) != TRAIN_COMMODITIES:
-        raise ValueError("V1.1 train commodities must be FG/SA/JM/SH/SP in that order")
-    if data["held_out_commodity"] != HELD_OUT_COMMODITY:
-        raise ValueError("V1.1 held-out commodity must be RB")
+    train_commodities = data.get("train_commodities")
+    if (
+        not isinstance(train_commodities, list) or not train_commodities
+        or any(not isinstance(value, str) or not value for value in train_commodities)
+        or len(set(train_commodities)) != len(train_commodities)
+    ):
+        raise ValueError("V1.1 data.train_commodities must be a nonempty unique string list")
+    held_out = data.get("held_out_commodity")
+    if not isinstance(held_out, str) or not held_out or held_out in train_commodities:
+        raise ValueError("V1.1 held-out commodity must be nonempty and absent from Train commodities")
     fixed = {
         "minute_capacity": 512, "daily_capacity": 256,
         "current_weekly_capacity": 64, "horizons": [16, 64, 256],
@@ -145,7 +151,7 @@ def validate_v11_config(config: dict[str, Any]) -> None:
     commodity_years = history["commodity_years"]
     if not isinstance(commodity_years, dict):
         raise ValueError("history_week.commodity_years must be a mapping")
-    unknown = set(commodity_years) - set((*TRAIN_COMMODITIES, HELD_OUT_COMMODITY))
+    unknown = set(commodity_years) - set((*train_commodities, held_out))
     if unknown:
         raise ValueError(f"unknown history_week commodity override: {sorted(unknown)}")
     if any(

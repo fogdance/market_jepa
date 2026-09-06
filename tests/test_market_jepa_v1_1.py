@@ -17,10 +17,16 @@ from market_jepa_v1_1.config import (
 )
 from market_jepa_v1_1.dataset import (
     BAR_COLUMNS, V11ContractDataset, V11DataStore, collate_v11_batch,
+    fit_v11_shared_scaler,
 )
 from market_jepa_v1_1.imc import IMCOrigin, SharedIMCScaler, V11IMCTransform
 from market_jepa_v1_1.sampler import HierarchicalCommodityContractSampler
-from market_jepa_v1_1.checkpoint import load_v11_checkpoint, model_from_checkpoint, validate_v11_checkpoint
+from market_jepa_v1_1.checkpoint import (
+    load_v11_checkpoint, model_from_checkpoint, validate_v11_checkpoint,
+    v11_implementation_manifest,
+)
+from market_jepa_v1_1.formal_training import EPOCH_FIELDS, validate_formal_training_config
+from market_jepa_v1_1.development import audit_history_week_eligibility
 from market_jepa_v1_1.training import V11Trainer
 
 
@@ -256,7 +262,7 @@ def test_v11_shared_scaler_only():
     assert scaler.fitted_commodities == tuple(sorted(TRAIN_COMMODITIES))
     restored = SharedIMCScaler.from_dict(scaler.to_dict())
     assert restored.checksum == scaler.checksum
-    with pytest.raises(ValueError, match="all Train commodities"):
+    with pytest.raises(ValueError, match="every configured Train commodity"):
         SharedIMCScaler.fit(_scaler_population()[:-1])
 
 
@@ -910,9 +916,57 @@ def test_v11_fixed_budget_checkpoint_only(trained_v11_checkpoint):
     state = load_v11_checkpoint(path / "last.pt")
     assert state["checkpoint_selection"] == "fixed_budget_final"
     assert state["history"][0]["validation"] is not None
+    assert set(EPOCH_FIELDS) <= set(state["history"][0])
+    assert state["history"][0]["optimizer_steps_this_epoch"] == 1
     tampered = deepcopy(state); tampered["checkpoint_selection"] = "validation_h64"
     with pytest.raises(ValueError, match="fixed_budget_final"):
         validate_v11_checkpoint(tampered)
+
+
+def test_v11_formal_training_contract_is_frozen():
+    config = deepcopy(DEFAULT_V11_CONFIG)
+    validate_formal_training_config(config)
+    changed = deepcopy(config); changed["history_week"]["commodity_years"] = {"SH": 3}
+    with pytest.raises(ValueError, match="frozen commodity history"):
+        validate_formal_training_config(changed)
+    changed = deepcopy(config); changed["training"]["batch_size"] = 32
+    with pytest.raises(ValueError, match="training configuration mismatch"):
+        validate_formal_training_config(changed)
+
+
+def test_v11_formal_entrypoint_is_checkpointed_implementation():
+    manifest = v11_implementation_manifest()
+    assert "train_market_jepa_v1_1.py" in manifest["files"]
+    assert "market_jepa_v1_1/formal_training.py" in manifest["files"]
+
+
+def test_v11_train_commodity_population_is_configurable():
+    config = deepcopy(DEFAULT_V11_CONFIG)
+    config["profile"] = "debug"
+    config["data"]["train_commodities"] = ["FG"]
+    config["history_week"].update(commodity_years={}, require_full_history=False)
+    validate_v11_config(config)
+    unscaled = V11ContractDataset(_make_store(("FG",)), config)
+    scaler = fit_v11_shared_scaler(unscaled, anchors_per_commodity=2)
+    dataset = V11ContractDataset(_make_store(("FG",)), config, scaler=scaler)
+    sampler = HierarchicalCommodityContractSampler(dataset, num_samples=10, seed=42)
+    assert sampler.commodities == ("FG",)
+    assert scaler.fitted_commodities == ("FG",)
+
+
+def test_v11_eligibility_audit_uses_only_configured_commodities(tmp_path):
+    store = _make_store(("FG", "SA"))
+    store.episode_table.to_csv(tmp_path / "contract_episodes.csv", index=False)
+    commodity_path = tmp_path / "FG"
+    commodity_path.mkdir()
+    store.frames["FG"]["weekly"].to_csv(commodity_path / "FG_1w.csv", index=False)
+    config = deepcopy(DEFAULT_V11_CONFIG)
+    config["profile"] = "debug"
+    config["data"]["train_commodities"] = ["FG"]
+    config["history_week"].update(commodity_years={}, require_full_history=False)
+    report = audit_history_week_eligibility(tmp_path, config, tmp_path / "audit")
+    assert set(report["commodities"]) == {"FG"}
+    assert {record["commodity"] for record in report["contracts"]} == {"FG"}
 
 
 def test_v11_checkpoint_roundtrip(trained_v11_checkpoint):

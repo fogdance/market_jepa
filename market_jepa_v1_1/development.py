@@ -165,7 +165,10 @@ def lengths_from_config(model: dict) -> dict:
     }
 
 
-def inspect_production_data(root: Path) -> dict:
+def inspect_production_data(
+    root: Path, commodities: tuple[str, ...] = TRAIN_COMMODITIES,
+    held_out_commodity: str = "RB",
+) -> dict:
     episodes = pd.read_csv(root / "contract_episodes.csv")
     required = {
         "commodity", "contract_uid", "delivery_year", "delivery_month", "series_key",
@@ -175,7 +178,7 @@ def inspect_production_data(root: Path) -> dict:
     counts = episodes.groupby(["commodity", "role"]).size().to_dict()
     files = {}
     schemas = {}
-    for commodity in (*TRAIN_COMMODITIES, "RB"):
+    for commodity in (*commodities, held_out_commodity):
         files[commodity] = {}
         for scale in ("1m", "1d", "1w"):
             path = root / commodity / f"{commodity}_{scale}.csv"
@@ -218,11 +221,13 @@ def inspect_production_data(root: Path) -> dict:
     return report
 
 
-def audit_full_production_bars(root: Path) -> dict:
+def audit_full_production_bars(
+    root: Path, commodities: tuple[str, ...] = TRAIN_COMMODITIES,
+) -> dict:
     """Hard-gate every Train commodity's bar schema, values and cache parity."""
     result = {}
     required = {"contract_uid", "open", "high", "low", "close", "volume", "open_interest"}
-    for commodity in TRAIN_COMMODITIES:
+    for commodity in commodities:
         minute_path = root / commodity / f"{commodity}_1m.csv"
         daily_path = root / commodity / f"{commodity}_1d.csv"
         weekly_path = root / commodity / f"{commodity}_1w.csv"
@@ -318,9 +323,11 @@ def audit_full_production_bars(root: Path) -> dict:
 
 def audit_history_week_eligibility(root: Path, config: dict, output: Path) -> dict:
     output.mkdir(parents=True, exist_ok=True)
-    episodes = pd.read_csv(root / "contract_episodes.csv")
     frames = {}
-    for commodity in TRAIN_COMMODITIES:
+    train_commodities = tuple(config["data"]["train_commodities"])
+    episodes = pd.read_csv(root / "contract_episodes.csv")
+    episodes = episodes.loc[episodes.commodity.isin(train_commodities)].copy()
+    for commodity in train_commodities:
         weekly = pd.read_csv(root / commodity / f"{commodity}_1w.csv")
         weekly["week_end_date"] = pd.to_datetime(weekly["week_end_date"], errors="raise")
         for column in BAR_COLUMNS:
@@ -333,13 +340,13 @@ def audit_history_week_eligibility(root: Path, config: dict, output: Path) -> di
         commodity_years={str(key): int(value) for key, value in history["commodity_years"].items()},
         require_full_history=bool(history["require_full_history"]), role="train",
     )
-    order = {commodity: index for index, commodity in enumerate(TRAIN_COMMODITIES)}
+    order = {commodity: index for index, commodity in enumerate(train_commodities)}
     records.sort(key=lambda record: (order[record["commodity"]], record["main_start"], record["episode_id"]))
-    summaries = {commodity: summaries[commodity] for commodity in TRAIN_COMMODITIES}
+    summaries = {commodity: summaries[commodity] for commodity in train_commodities}
     pd.DataFrame(records).to_csv(output / "history_week_eligibility.csv", index=False)
     blockers = [
         {"commodity": commodity, "eligible_contract_count": 0, "reason": summary["reason"]}
-        for commodity in TRAIN_COMMODITIES
+        for commodity in train_commodities
         for summary in (summaries[commodity],)
         if summary["eligible_contract_count"] == 0
     ]
@@ -352,11 +359,18 @@ def audit_history_week_eligibility(root: Path, config: dict, output: Path) -> di
     return report
 
 
-def audit_contract_lineages(root: Path, output: Path) -> dict:
+def audit_contract_lineages(
+    root: Path, output: Path, *, commodities: tuple[str, ...] | None = None,
+) -> dict:
     """Persist the package's explicit lineage facts plus the frozen overlap disposition."""
     output.mkdir(parents=True, exist_ok=True)
     source = root / "lineage_audit.csv"
     lineage = pd.read_csv(source)
+    if commodities is not None:
+        lineage = lineage.loc[lineage.commodity.isin(commodities)].copy()
+        missing_commodities = sorted(set(commodities) - set(lineage.commodity.astype(str)))
+        if missing_commodities:
+            raise ValueError(f"lineage audit lacks configured commodities: {missing_commodities}")
     required = {
         "commodity", "delivery_month", "series_key", "contract_uid", "delivery_year",
         "first_weekly_date", "last_weekly_date", "main_start", "main_end",
@@ -365,7 +379,8 @@ def audit_contract_lineages(root: Path, output: Path) -> dict:
     missing = sorted(required - set(lineage))
     if missing:
         raise ValueError(f"lineage audit missing columns: {missing}")
-    order = {commodity: index for index, commodity in enumerate((*TRAIN_COMMODITIES, "RB"))}
+    ordered_commodities = commodities or (*TRAIN_COMMODITIES, "RB")
+    order = {commodity: index for index, commodity in enumerate(ordered_commodities)}
     lineage["_commodity_order"] = lineage.commodity.map(order).fillna(len(order))
     lineage = lineage.sort_values(
         ["_commodity_order", "series_key", "delivery_year"], kind="mergesort",
@@ -396,7 +411,7 @@ def audit_contract_lineages(root: Path, output: Path) -> dict:
         "overlap_stitching_rule": "keep_previous_delivery_year",
         "series": series,
         "fg_required_lineages": {
-            key: series[key] for key in ("FG-01", "FG-05", "FG-09")
+            key: series[key] for key in ("FG-01", "FG-05", "FG-09") if key in series
         },
         "contracts": json.loads(lineage.to_json(orient="records")),
     }
@@ -409,7 +424,8 @@ def production_smoke(
     eligibility: dict | None = None,
 ) -> tuple[dict, dict, dict]:
     root = Path(config["data"]["root"])
-    full_bar_audit = full_bar_audit or audit_full_production_bars(root)
+    train_commodities = tuple(config["data"]["train_commodities"])
+    full_bar_audit = full_bar_audit or audit_full_production_bars(root, train_commodities)
     if eligibility is None:
         eligibility = audit_history_week_eligibility(root, config, output)
     eligible_contracts = {
@@ -420,13 +436,13 @@ def production_smoke(
                 key=lambda record: (record["main_start"], record["episode_id"]),
             )["contract_uid"]
         }
-        for commodity in TRAIN_COMMODITIES
+        for commodity in train_commodities
     }
     store = V11DataStore.from_directory(
-        root, TRAIN_COMMODITIES, contracts_by_commodity=eligible_contracts,
+        root, train_commodities, contracts_by_commodity=eligible_contracts,
     )
     daily_parity = {}
-    for commodity in TRAIN_COMMODITIES:
+    for commodity in train_commodities:
         minute = store.frames[commodity]["minute"]
         aggregated = minute.groupby(["contract_uid", "trading_date"], sort=True).agg(
             open=("open", "first"), high=("high", "max"), low=("low", "min"),
@@ -562,10 +578,19 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
     counts = parameter_counts(config); write_json(output / "parameter_counts.json", counts)
     current_v0 = manifest_sha256(implementation_manifest())
     v0_safe = current_v0 == V0_MANIFEST_BEFORE
-    data_report = inspect_production_data(Path(config["data"]["root"]))
-    lineage_audit = audit_contract_lineages(Path(config["data"]["root"]), output)
+    train_commodities = tuple(config["data"]["train_commodities"])
+    held_out_commodity = str(config["data"]["held_out_commodity"])
+    data_report = inspect_production_data(
+        Path(config["data"]["root"]), train_commodities, held_out_commodity,
+    )
+    lineage_audit = audit_contract_lineages(
+        Path(config["data"]["root"]), output,
+        commodities=(*train_commodities, held_out_commodity),
+    )
     eligibility = audit_history_week_eligibility(Path(config["data"]["root"]), config, output)
-    full_bar_audit = audit_full_production_bars(Path(config["data"]["root"]))
+    full_bar_audit = audit_full_production_bars(
+        Path(config["data"]["root"]), train_commodities,
+    )
     data_report["history_week_eligibility"] = eligibility
     data_report["contract_lineage_audit"] = lineage_audit
     data_report["full_production_bar_audit"] = full_bar_audit
@@ -628,13 +653,13 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
     protocol = {
         "design_version": "1.1", "purpose": "implementation/data/smoke verification only",
         "formal_training_started": False, "rb_evaluation_started": False,
-        "train_commodities": list(TRAIN_COMMODITIES), "held_out": "RB",
+        "train_commodities": list(train_commodities), "held_out": held_out_commodity,
         "checkpoint_selection": "fixed_budget_final", "optimizer_step_budget": config["development"]["optimizer_steps"],
         "history_week": dict(config["history_week"]),
         "historical_weekly_selection": "same series_key; overlap keeps previous delivery year",
         "eligible_contract_counts": {
             commodity: eligibility["commodities"][commodity]["eligible_contract_count"]
-            for commodity in TRAIN_COMMODITIES
+            for commodity in train_commodities
         },
     }
     write_json(output / "protocol.json", protocol)
@@ -652,9 +677,9 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
         f"{item['commodity']}: {item['reason']}" for item in eligibility["blockers"]
     ) or "NONE"
     scaler_text = (
-        "Shared scaler fitted by FG/SA/JM/SH/SP only: YES."
+        f"Shared scaler fitted by configured Train commodities {list(train_commodities)} only: YES."
         if production["status"] == "PASS"
-        else "Shared scaler fitter requires FG/SA/JM/SH/SP only; fit did not run because eligibility was blocked."
+        else "Shared scaler fitter requires every configured Train commodity; fit did not run because eligibility was blocked."
     )
     self_review = [
         f"V0 regression-safe: {'YES' if v0_safe and test_result['status'] == 'PASS' else 'NO'}. Manifest {current_v0}.",
@@ -672,7 +697,7 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
         "Future target is market-only: YES.",
         "Commodity embedding/ID shortcut exists: NO.",
         scaler_text,
-        "RB participated in fitting: NO.",
+        f"Held-out {held_out_commodity} participated in fitting: NO.",
         "Sampler is Commodity -> Contract -> Anchor: YES.",
         "Intended online parameters with grad=None: NONE.",
         f"Parameters V0/V1.0/V1.1: {counts['v0_trainable']}/{counts['v1_0_trainable']}/{counts['v1_1_trainable']}.",
