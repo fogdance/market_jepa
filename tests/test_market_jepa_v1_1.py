@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 import torch
 
+from benchmark_market_jepa_v1_1_batch import profile_plan
 from market_jepa.model import jepa_loss
 from market_jepa_v1_1 import DEFAULT_V11_CONFIG, MarketJEPAV11
 from market_jepa_v1_1.config import (
@@ -827,8 +828,6 @@ def test_v11_collate_keeps_metadata_outside_model(contract_dataset):
 class _TrainerDataset(torch.utils.data.Dataset):
     def __init__(self) -> None:
         self.scaler = SharedIMCScaler.fit(_scaler_population())
-        self.daily_truncation_count = 0
-        self.daily_truncated_tokens = 0
         self.episode_arrays = [
             SimpleNamespace(
                 episode=SimpleNamespace(commodity=commodity, key=(commodity, f"X{index}", 0)),
@@ -875,7 +874,10 @@ class _TrainerDataset(torch.utils.data.Dataset):
             h: torch.ones(h, len(IMC_FEATURES), dtype=torch.bool) for h in (16, 64, 256)
         }
         sample["target_minute_mask"] = {h: torch.zeros(h, dtype=torch.bool) for h in (16, 64, 256)}
-        sample["metadata"] = {"commodity": TRAIN_COMMODITIES[index], "contract_uid": f"X{index}"}
+        sample["metadata"] = {
+            "commodity": TRAIN_COMMODITIES[index], "contract_uid": f"X{index}",
+            "daily_was_truncated": True, "daily_truncated_tokens": 3,
+        }
         return sample
 
 
@@ -918,6 +920,8 @@ def test_v11_fixed_budget_checkpoint_only(trained_v11_checkpoint):
     assert state["history"][0]["validation"] is not None
     assert set(EPOCH_FIELDS) <= set(state["history"][0])
     assert state["history"][0]["optimizer_steps_this_epoch"] == 1
+    assert state["daily_truncation_count"] == 2
+    assert state["daily_truncated_tokens"] == 6
     tampered = deepcopy(state); tampered["checkpoint_selection"] = "validation_h64"
     with pytest.raises(ValueError, match="fixed_budget_final"):
         validate_v11_checkpoint(tampered)
@@ -926,6 +930,9 @@ def test_v11_fixed_budget_checkpoint_only(trained_v11_checkpoint):
 def test_v11_formal_training_contract_is_frozen():
     config = deepcopy(DEFAULT_V11_CONFIG)
     validate_formal_training_config(config)
+    assert config["training"]["batch_size"] == 64
+    assert config["training"]["gradient_accumulation"] == 2
+    assert config["training"]["num_workers"] == 8
     changed = deepcopy(config); changed["history_week"]["commodity_years"] = {"SH": 3}
     with pytest.raises(ValueError, match="frozen commodity history"):
         validate_formal_training_config(changed)
@@ -938,6 +945,31 @@ def test_v11_formal_entrypoint_is_checkpointed_implementation():
     manifest = v11_implementation_manifest()
     assert "train_market_jepa_v1_1.py" in manifest["files"]
     assert "market_jepa_v1_1/formal_training.py" in manifest["files"]
+
+
+def test_v11_multiworker_runtime_reports_truncation(tmp_path):
+    config = _trainer_config(tmp_path)
+    config["training"]["num_workers"] = 1
+    dataset = _TrainerDataset()
+    trainer = V11Trainer(
+        MarketJEPAV11(config["model"], debug=True), config, dataset, torch.device("cpu"),
+        samples_per_epoch=2, data_manifest_sha256="synthetic-data",
+    )
+    trainer.fit()
+    assert trainer.daily_truncation_count == 2
+    assert trainer.daily_truncated_tokens == 6
+    state = load_v11_checkpoint(tmp_path / "last.pt")
+    assert state["daily_truncation_count"] == 2
+    assert state["daily_truncated_tokens"] == 6
+
+
+def test_v11_batch_sweep_preserves_only_comparable_effective_batch():
+    plans = profile_plan((64, 128, 192, 256))
+    assert [(item["batch_size"], item["gradient_accumulation"]) for item in plans] == [
+        (64, 2), (128, 1), (192, 1), (256, 1),
+    ]
+    assert [item["effective_batch"] for item in plans] == [128, 128, 192, 256]
+    assert [item["formal_effective_batch_128_candidate"] for item in plans] == [True, True, False, False]
 
 
 def test_v11_train_commodity_population_is_configurable():

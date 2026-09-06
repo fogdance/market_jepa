@@ -504,8 +504,8 @@ def production_smoke(
         "amp_calibration": trainer.amp_calibration,
         "peak_allocated_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else None,
         "peak_reserved_bytes": torch.cuda.max_memory_reserved() if device.type == "cuda" else None,
-        "daily_truncation_count": train_dataset.daily_truncation_count,
-        "daily_truncated_tokens": train_dataset.daily_truncated_tokens,
+        "daily_truncation_count": trainer.daily_truncation_count,
+        "daily_truncated_tokens": trainer.daily_truncated_tokens,
         "included_contracts": len(train_dataset.episode_arrays),
         "development_contract_limit_per_commodity": 1,
         "selected_eligible_contracts": {

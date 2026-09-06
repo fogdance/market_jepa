@@ -59,7 +59,7 @@ training:
   lambda_cov: 0.0
   variance_floor: 1.0
   collapse_threshold: 0.05
-  num_workers: 0
+  num_workers: 8
   checkpoint_dir: artifacts/checkpoints/v1_1
 development:
   optimizer_steps: 100

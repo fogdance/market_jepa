@@ -110,6 +110,7 @@ class V11Trainer:
         self.amp_calibration: list[dict[str, float | bool]] = []
         self.global_step = 0; self.start_epoch = 0; self.history: list[dict] = []
         self.skipped_optimizer_steps = 0; self.gradient_connectivity: dict | None = None
+        self.daily_truncation_count = 0; self.daily_truncated_tokens = 0
         self.checkpoint_dir = Path(training["checkpoint_dir"])
         self.manifest = v11_implementation_manifest(); self.manifest_digest = manifest_sha256(self.manifest)
 
@@ -157,6 +158,15 @@ class V11Trainer:
         if training:
             self.optimizer.zero_grad(set_to_none=True)
         for index, raw in enumerate(loader):
+            if training:
+                self.daily_truncation_count += sum(
+                    bool(metadata.get("daily_was_truncated", False))
+                    for metadata in raw["metadata"]
+                )
+                self.daily_truncated_tokens += sum(
+                    int(metadata.get("daily_truncated_tokens", 0))
+                    for metadata in raw["metadata"]
+                )
             kwargs = model_inputs(raw, self.device)
             if training:
                 self._calibrate_amp(kwargs)
@@ -212,8 +222,8 @@ class V11Trainer:
             "checkpoint_selection": self.checkpoint_selection,
             "v11_implementation_manifest": self.manifest,
             "v11_implementation_sha256": self.manifest_digest,
-            "daily_truncation_count": self.train_dataset.daily_truncation_count,
-            "daily_truncated_tokens": self.train_dataset.daily_truncated_tokens,
+            "daily_truncation_count": self.daily_truncation_count,
+            "daily_truncated_tokens": self.daily_truncated_tokens,
             "skipped_optimizer_steps": self.skipped_optimizer_steps,
             "amp_calibration": self.amp_calibration,
             "history": self.history, "gradient_connectivity": self.gradient_connectivity,
@@ -282,5 +292,7 @@ class V11Trainer:
         self.sampler.load_state_dict(state["sampler"])
         self.global_step = int(state["global_step"]); self.start_epoch = int(state["epoch"]) + 1
         self.history = list(state["history"]); self.skipped_optimizer_steps = int(state.get("skipped_optimizer_steps", 0))
+        self.daily_truncation_count = int(state["daily_truncation_count"])
+        self.daily_truncated_tokens = int(state["daily_truncated_tokens"])
         self.gradient_connectivity = state.get("gradient_connectivity")
         self.amp_calibration = list(state.get("amp_calibration", [])); self.amp_calibrated = True

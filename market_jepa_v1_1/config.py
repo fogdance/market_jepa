@@ -80,7 +80,7 @@ DEFAULT_V11_CONFIG: dict[str, Any] = {
         "dropout": 0.1,
         "commodity_embedding": False,
     },
-    "training": deepcopy(DEFAULT_CONFIG["training"]),
+    "training": {**deepcopy(DEFAULT_CONFIG["training"]), "num_workers": 8},
     "development": {
         "optimizer_steps": 100,
         "batch_size": 2,

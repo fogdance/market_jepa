@@ -104,6 +104,7 @@ def validate_formal_training_config(config: dict[str, Any]) -> None:
         "gradient_clip_norm": 1.0,
         "ema_tau": 0.996,
         "amp": True,
+        "num_workers": 8,
     }
     mismatches = {
         name: {"expected": expected, "actual": config["training"].get(name)}
@@ -274,6 +275,7 @@ def run_formal_training(
     write_json(output / "parameter_counts.json", counts)
     protocol = {
         "design_version": "1.1",
+        "model_scale": "V1.1-S",
         "git_commit": git_commit,
         "git_tracked_worktree_dirty_at_start": git_dirty,
         "config_sha256": config_sha256,
@@ -298,6 +300,7 @@ def run_formal_training(
         "gradient_accumulation": config["training"]["gradient_accumulation"],
         "epochs": config["training"]["max_epochs"],
         "seed": config["training"]["seed"],
+        "num_workers": config["training"]["num_workers"],
         "shared_scaler_fitting_population": list(train_commodities),
         "scaler_anchors_per_commodity": scaler_anchors_per_commodity,
         "scaler_selected_anchor_count": scaler_selection,

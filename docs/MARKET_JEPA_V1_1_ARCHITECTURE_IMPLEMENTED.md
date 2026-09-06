@@ -22,6 +22,16 @@ commodities inherit `history_week.years=3` unless they receive an explicit
 `history_week.commodity_years` override; `SH: 2` is an intentional current-run
 override rather than a fallback.
 
+The formal runtime keeps the frozen effective batch at 128 (`batch_size=64`,
+`gradient_accumulation=2`) and uses eight DataLoader workers. A real-data
+throughput sweep found no material batch-only advantage for `128 x 1` over
+`64 x 2` in the longer A/B window (225.65 versus 224.49 samples/s), while eight
+workers removed the confirmed `num_workers=0` input bottleneck without changing
+the optimization semantics. The V1.1-S architecture and parameter count remain
+unchanged. Daily truncation flags travel with each sample and are accumulated by
+the trainer process, so the formal counters remain exact with multi-process data
+loading and across strict resume.
+
 ## Actual hierarchy
 
 ```text

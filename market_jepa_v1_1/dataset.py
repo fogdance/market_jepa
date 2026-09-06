@@ -455,8 +455,6 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
         self._eligible_contract_keys = eligible_keys
         self.episode_arrays: list[EpisodeArrays] = []
         self.offsets = [0]
-        self.daily_truncation_count = 0
-        self.daily_truncated_tokens = 0
         self.excluded_episodes: list[dict[str, str]] = []
         self._history_cache: dict[tuple[str, str, int], tuple[np.ndarray, ...]] = {}
         self._history_row_cache: dict[tuple[str, str, int], pd.DataFrame] = {}
@@ -723,9 +721,7 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
             origin=arrays.daily_origin, prior_volume=arrays.daily_prior_volume,
             previous_close=arrays.daily_previous_close, previous_oi=arrays.daily_previous_oi,
         )
-        if len(daily_sequence) > self.daily_capacity:
-            self.daily_truncation_count += 1
-            self.daily_truncated_tokens += len(daily_sequence) - self.daily_capacity
+        daily_truncated_tokens = max(0, len(daily_sequence) - self.daily_capacity)
         daily_values, daily_valid, daily_mask = self._pad(
             self._scaled(daily_market_raw, daily_validity_raw), daily_validity_raw, self.daily_capacity,
         )
@@ -823,6 +819,8 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
                 "episode_id": arrays.episode.episode_id,
                 "anchor_datetime": str(arrays.minute_frame.iloc[anchor].datetime),
                 "anchor_position": anchor,
+                "daily_was_truncated": bool(daily_truncated_tokens),
+                "daily_truncated_tokens": daily_truncated_tokens,
             },
         }
 
