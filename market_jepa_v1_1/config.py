@@ -27,12 +27,12 @@ MINUTE_CONTEXT_FEATURES = (
     "day_of_week_cos", "log1p_delta_minutes",
 )
 DAILY_CONTEXT_FEATURES = (
-    "days_since_main", "is_main", "days_since_lost_main",
-    "bar_is_partial", "elapsed_minutes_in_trading_day",
+    "days_since_main_fraction", "is_main", "days_since_lost_main_fraction",
+    "bar_is_partial", "observed_minute_count_fraction",
 )
 WEEKLY_CONTEXT_FEATURES = (
-    "weeks_ago", "contract_age", "memory_source",
-    "bar_is_partial", "elapsed_trading_days_in_week",
+    "weeks_ago_fraction", "contract_age_fraction", "memory_source",
+    "bar_is_partial", "elapsed_trading_days_fraction",
 )
 
 DEFAULT_V11_CONFIG: dict[str, Any] = {

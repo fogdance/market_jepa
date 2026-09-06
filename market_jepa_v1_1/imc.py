@@ -38,6 +38,10 @@ class V11IMCTransform:
     feature_order = IMC_FEATURES
 
     @staticmethod
+    def volume_baseline(prior_volume: np.ndarray) -> tuple[float, bool]:
+        return _positive_median(prior_volume)
+
+    @staticmethod
     def origin(close: np.ndarray, oi: np.ndarray, prior_volume: np.ndarray) -> IMCOrigin:
         close = np.asarray(close, dtype=np.float64)
         oi = np.asarray(oi, dtype=np.float64)

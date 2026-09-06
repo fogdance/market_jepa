@@ -43,10 +43,10 @@ At each minute anchor:
 - Minute is the latest 512 same-contract rows, left padded.
 - Daily is completed lifecycle days plus exactly one current partial bar aggregated from same-contract minute rows with `datetime <= anchor` and the anchor `trading_date`.
 - Current Weekly is completed lifecycle weeks plus exactly one partial lifecycle week aggregated only through anchor.
-- Historical Weekly is the preceding three-year interval `[main_start-3Y, main_start)`, clipped to 156 tokens. Each visible real-contract segment resets IMC and marks its first token with `contract_boundary=1`.
+- Historical Weekly is the preceding three-year interval `[main_start-3Y, main_start)`, clipped to 156 tokens. Each visible real-contract episode resets IMC and marks its first token with `contract_boundary=1`; the segment key is `(contract_uid, episode_id)`.
 - Anchors after loss of main status are bounded by `anchor_end_date`; the supplied package uses the episode calendar's 15-trading-day extension policy.
 
-Cached 1d/1w bars are never used as the current forming bar. Weekly lifecycle bars are reconstructed from contract-local closed Daily lifecycle bars so a main-start week cannot import pre-main days. `bar_is_partial` and causal progress fields are explicit context features.
+Cached 1d/1w bars are never used as the current forming bar. Weekly lifecycle bars are reconstructed from contract-local closed Daily lifecycle bars so a main-start week cannot import pre-main days. `bar_is_partial` and causal progress fields are explicit context features. Context numeric values are bounded to `[0,1]`: days since main/256, days since lost-main/21, observed intraday bar count/512, weeks ago/156, contract age/64 and observed trading days/5. Intraday progress therefore does not use wall-clock gaps across night sessions.
 
 The implementation requires all H16/H64/H256 targets to exist. An anchor without H256 inside its real-contract minute array is excluded; no per-horizon fallback can cross a roll.
 
@@ -82,9 +82,9 @@ All four market inputs and future targets use the same nine ordered coordinates:
 8. `Volume/M0_volume`
 9. `Volume/median(previous 20 Volume)`
 
-Minute `P0` is the first valid window Close and `OI0` is its OI. Its fixed Volume baseline is the median of exactly 20 bars immediately before the window. Daily and Current Weekly Price/OI origins are fixed for the whole lifecycle at the first observable main-start minute Open/OI; their Volume baselines use 20 closed same-contract Daily/Weekly bars before main start. Historical Weekly resets independently at each visible contract segment.
+Minute `P0` is the first valid window Close and `OI0` is its OI. Its fixed Volume baseline is the median of exactly 20 bars immediately before the window. Daily and Current Weekly Price/OI origins are fixed for the whole lifecycle at the first observable main-start minute Open/OI; their Volume baselines use 20 closed same-contract Daily/Weekly bars before main start. Historical Weekly uses those same main-start Price/OI references and the same pre-main fixed Volume baseline for each historical episode, so a contract retains lifecycle coordinates when it moves from Current to Historical memory. Historical Q20 still uses the 20 observations immediately before the visible memory segment. The directory loader scans causal episode origins without retaining all historical minute bars.
 
-Unavailable or nonpositive baselines produce numeric zero plus coordinate validity false; no epsilon and no future fill are used. A single post-IMC scaler is fitted jointly from FG/SA/JM/SH/SP online-memory snapshots. It stores means, standard deviations, feature counts, per-source population counts, exact feature order, fitted commodities and a SHA-256 checksum. The fitter rejects RB and rejects a population missing any of the five Train commodities.
+Unavailable or nonpositive baselines produce numeric zero plus coordinate validity false; no epsilon and no future fill are used. A single post-IMC scaler is fitted jointly from FG/SA/JM/SH/SP online-memory snapshots. It stores means, standard deviations, feature counts, per-source population counts, exact feature order, fitted commodities and a SHA-256 checksum. The fitter rejects RB and rejects a population missing any of the five Train commodities. Historical-memory cache entries are always raw IMC; the frozen scaler is applied only when a sample is returned. A read-only `scaler` property plus `set_scaler()` prevents the former stale-cache lifecycle bug.
 
 ## Encoders and information flow
 
@@ -122,8 +122,8 @@ Trainable parameter counts are:
 
 V1.1 is 1.766843× V0, below the 3× stop threshold.
 
-Production integration uses `/data/jepa/v1_1_raw`. All six commodities have real-contract 1m/1d/1w files and the episode calendar. Existing source audit findings are handled explicitly: missing contracts are excluded, missing warmup becomes invalid coordinates, anchors use observed same-contract rows, and extra post-anchor rows never enter online memory. Detailed evidence is in `artifacts/evaluation/v1_1_architecture_development/data_contract_report.json`.
+Production integration uses `/data/jepa/v1_1_raw`. All six commodities have real-contract 1m/1d/1w files and the episode calendar. Existing source audit findings are handled explicitly: missing contracts are excluded, missing warmup becomes invalid coordinates, anchors use observed same-contract rows, and extra post-anchor rows never enter online memory. The development hard gate scans every Train minute row for Price/OI/Volume/OHLC validity and contract coverage, verifies every available minute→Daily cache row, and verifies every Daily→Weekly cache row. Nonpositive OI is not silently accepted: its IMC validity is false. Detailed evidence is in `artifacts/evaluation/v1_1_architecture_development/data_contract_report.json`.
 
 ## Deviations from the frozen design
 
-There are no theory or architecture deviations. The development 100-step smoke deliberately limits loaded current-minute episodes to one recent valid episode per Train commodity to bound runtime; it is not an official scaler fit or formal benchmark run. The production loader, dataset and sampler support all supplied episodes. No RB data was read by the smoke.
+There are no theory or architecture deviations. The development 100-step smoke deliberately limits loaded current-minute episodes to one recent valid episode per Train commodity to bound runtime; it is not an official scaler fit or formal benchmark run. The production loader, dataset and sampler support all supplied episodes. No RB data was read by the smoke. RB validation/test should remain one held-out role with time/anchor splits; independently, historical visibility is causal by timestamp and does not discard earlier episodes merely because a role label differs.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -212,8 +213,107 @@ def inspect_production_data(root: Path) -> dict:
     return report
 
 
+def audit_full_production_bars(root: Path) -> dict:
+    """Hard-gate every Train commodity's bar schema, values and cache parity."""
+    result = {}
+    required = {"contract_uid", "open", "high", "low", "close", "volume", "open_interest"}
+    for commodity in TRAIN_COMMODITIES:
+        minute_path = root / commodity / f"{commodity}_1m.csv"
+        daily_path = root / commodity / f"{commodity}_1d.csv"
+        weekly_path = root / commodity / f"{commodity}_1w.csv"
+        partial_days, minute_row_count = [], 0
+        invalid_prices, invalid_oi, invalid_volume, invalid_ohlc = 0, 0, 0, 0
+        minute_columns = ["contract_uid", "datetime", "trading_date", "open", "high", "low", "close", "volume", "open_interest"]
+        if not required.issubset(pd.read_csv(minute_path, nrows=0).columns):
+            raise ValueError(f"{commodity} minute schema is incomplete")
+        for chunk in pd.read_csv(minute_path, usecols=minute_columns, chunksize=250_000):
+            minute_row_count += len(chunk)
+            for column in ("open", "high", "low", "close", "volume", "open_interest"):
+                chunk[column] = pd.to_numeric(chunk[column], errors="coerce")
+            prices = chunk[["open", "high", "low", "close"]]
+            invalid_prices += int((~np.isfinite(prices) | (prices <= 0)).any(axis=1).sum())
+            invalid_oi += int((~np.isfinite(chunk.open_interest) | (chunk.open_interest <= 0)).sum())
+            invalid_volume += int((~np.isfinite(chunk.volume) | (chunk.volume < 0)).sum())
+            invalid_ohlc += int(((chunk.high < prices.max(axis=1)) | (chunk.low > prices.min(axis=1))).sum())
+            grouped = chunk.groupby(["contract_uid", "trading_date"], sort=False).agg(
+                first_datetime=("datetime", "first"), open=("open", "first"), high=("high", "max"),
+                low=("low", "min"), close=("close", "last"), volume=("volume", "sum"),
+                open_interest=("open_interest", "last"),
+            ).reset_index()
+            partial_days.append(grouped)
+        minute_daily = pd.concat(partial_days, ignore_index=True)
+        minute_daily = minute_daily.sort_values(["contract_uid", "trading_date", "first_datetime"], kind="mergesort")
+        minute_daily = minute_daily.groupby(["contract_uid", "trading_date"], sort=True).agg(
+            open=("open", "first"), high=("high", "max"), low=("low", "min"),
+            close=("close", "last"), volume=("volume", "sum"), open_interest=("open_interest", "last"),
+        ).reset_index()
+        daily = pd.read_csv(daily_path)
+        weekly = pd.read_csv(weekly_path)
+        for name, frame in (("daily", daily), ("weekly", weekly)):
+            if not required.issubset(frame.columns):
+                raise ValueError(f"{commodity} {name} schema is incomplete")
+        joined_daily = minute_daily.merge(
+            daily, on=["contract_uid", "trading_date"], suffixes=("_minute", "_daily"),
+        )
+        daily_mismatches = {
+            column: int((~np.isclose(
+                joined_daily[f"{column}_minute"], joined_daily[f"{column}_daily"], rtol=0, atol=1e-8,
+            )).sum())
+            for column in ("open", "high", "low", "close", "volume", "open_interest")
+        }
+        daily["trading_date"] = pd.to_datetime(daily["trading_date"], errors="raise")
+        daily = daily.sort_values(["contract_uid", "trading_date"], kind="mergesort")
+        iso = daily.trading_date.dt.isocalendar()
+        daily["iso_year"], daily["iso_week"] = iso.year.to_numpy(), iso.week.to_numpy()
+        rebuilt_weekly = daily.groupby(["contract_uid", "iso_year", "iso_week"], sort=True).agg(
+            week_end_date=("trading_date", "max"), open=("open", "first"), high=("high", "max"),
+            low=("low", "min"), close=("close", "last"), volume=("volume", "sum"),
+            open_interest=("open_interest", "last"),
+        ).reset_index()
+        rebuilt_weekly["week_end_date"] = rebuilt_weekly.week_end_date.dt.strftime("%Y-%m-%d")
+        weekly["week_end_date"] = pd.to_datetime(weekly["week_end_date"], errors="raise").dt.strftime("%Y-%m-%d")
+        joined_weekly = rebuilt_weekly.merge(
+            weekly, on=["contract_uid", "week_end_date"], suffixes=("_rebuilt", "_cache"),
+        )
+        weekly_mismatches = {
+            column: int((~np.isclose(
+                joined_weekly[f"{column}_rebuilt"], joined_weekly[f"{column}_cache"], rtol=0, atol=1e-8,
+            )).sum())
+            for column in ("open", "high", "low", "close", "volume", "open_interest")
+        }
+        minute_contracts = set(minute_daily.contract_uid.astype(str))
+        coverage_missing = sorted(
+            (minute_contracts - set(daily.contract_uid.astype(str)))
+            | (minute_contracts - set(weekly.contract_uid.astype(str)))
+        )
+        report = {
+            "minute_rows": minute_row_count,
+            "minute_contracts": len(minute_contracts), "minute_days": len(minute_daily),
+            "daily_parity_rows": len(joined_daily), "daily_field_mismatches": daily_mismatches,
+            "weekly_parity_rows": len(joined_weekly), "weekly_field_mismatches": weekly_mismatches,
+            "invalid_price_rows": invalid_prices,
+            "nonpositive_or_invalid_oi_rows_masked_by_imc": invalid_oi,
+            "negative_or_invalid_volume_rows": invalid_volume, "invalid_ohlc_rows": invalid_ohlc,
+            "used_contracts_missing_daily_or_weekly": coverage_missing,
+        }
+        fatal = (
+            invalid_prices or invalid_volume or invalid_ohlc or coverage_missing
+            or any(daily_mismatches.values()) or any(weekly_mismatches.values())
+            or len(joined_daily) != len(minute_daily)
+            or len(joined_weekly) != len(rebuilt_weekly)
+        )
+        if fatal:
+            raise ValueError(f"{commodity} full production bar audit failed: {report}")
+        result[commodity] = report
+    return {
+        "status": "PASS", "commodities": result,
+        "oi_policy": "nonpositive/nonfinite OI is never accepted as valid numeric IMC; the coordinate validity mask is false",
+    }
+
+
 def production_smoke(config: dict, output: Path, device: torch.device) -> tuple[dict, dict, dict]:
     root = Path(config["data"]["root"])
+    full_bar_audit = audit_full_production_bars(root)
     store = V11DataStore.from_directory(root, TRAIN_COMMODITIES, max_contracts_per_commodity=1)
     daily_parity = {}
     for commodity in TRAIN_COMMODITIES:
@@ -234,7 +334,7 @@ def production_smoke(config: dict, output: Path, device: torch.device) -> tuple[
             raise ValueError(f"{commodity} minute-to-cached-Daily aggregation parity failed: {daily_parity[commodity]}")
     unscaled = V11ContractDataset(store, config, role="train")
     scaler = fit_v11_shared_scaler(unscaled, config["development"]["scaler_anchors_per_commodity"])
-    unscaled.scaler = scaler
+    train_dataset = V11ContractDataset(store, config, role="train", scaler=scaler)
     value = deepcopy(config)
     value["training"].update(
         batch_size=config["development"]["batch_size"], gradient_accumulation=1,
@@ -244,7 +344,7 @@ def production_smoke(config: dict, output: Path, device: torch.device) -> tuple[
     model = MarketJEPAV11(value["model"])
     steps = int(value["development"]["optimizer_steps"])
     trainer = V11Trainer(
-        model, value, unscaled, device, samples_per_epoch=steps * value["training"]["batch_size"],
+        model, value, train_dataset, device, samples_per_epoch=steps * value["training"]["batch_size"],
         data_manifest_sha256=sha256(root / "build_manifest.json"),
     )
     if device.type == "cuda":
@@ -256,12 +356,12 @@ def production_smoke(config: dict, output: Path, device: torch.device) -> tuple[
     state = load_v11_checkpoint(checkpoint)
     restored_model = model_from_checkpoint(state).to(device).eval()
     restored_trainer = V11Trainer(
-        restored_model, value, unscaled, device,
+        restored_model, value, train_dataset, device,
         samples_per_epoch=steps * value["training"]["batch_size"],
         data_manifest_sha256=state["data_manifest_sha256"],
     )
     restored_trainer.resume(state)
-    raw = collate_v11_batch([unscaled[0], unscaled[1]])
+    raw = collate_v11_batch([train_dataset[0], train_dataset[1]])
     kwargs = model_inputs(raw, device)
     model.eval()
     with torch.inference_mode():
@@ -278,12 +378,13 @@ def production_smoke(config: dict, output: Path, device: torch.device) -> tuple[
         "amp_calibration": trainer.amp_calibration,
         "peak_allocated_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else None,
         "peak_reserved_bytes": torch.cuda.max_memory_reserved() if device.type == "cuda" else None,
-        "daily_truncation_count": unscaled.daily_truncation_count,
-        "daily_truncated_tokens": unscaled.daily_truncated_tokens,
-        "included_contracts": len(unscaled.episode_arrays),
+        "daily_truncation_count": train_dataset.daily_truncation_count,
+        "daily_truncated_tokens": train_dataset.daily_truncated_tokens,
+        "included_contracts": len(train_dataset.episode_arrays),
         "development_contract_limit_per_commodity": 1,
-        "episodes_not_loaded_by_bounded_smoke": len(unscaled.excluded_episodes),
+        "episodes_not_loaded_by_bounded_smoke": len(train_dataset.excluded_episodes),
         "production_loader_supports_all_contracts": True,
+        "scaled_dataset_rebuilt_after_scaler_fit": True,
     }
     imc = {
         "status": "PASS", "feature_order": list(IMC_FEATURES),
@@ -293,6 +394,7 @@ def production_smoke(config: dict, output: Path, device: torch.device) -> tuple[
         "history_contract_boundary_reset": True,
         "minute_volume_semantics": "per-bar; same-contract sum reproduces cached Daily volume",
         "minute_to_cached_daily_parity": daily_parity,
+        "full_production_bar_audit": full_bar_audit,
     }
     return smoke, imc, trainer.gradient_connectivity or {}
 
@@ -301,6 +403,12 @@ def run_tests(output: Path) -> dict:
     # Isolate the existing DataLoader-fork regression and CUDA calibration.
     # Running them after the same pytest process has initialized CUDA/BLAS can
     # leave forked workers waiting during interpreter shutdown.
+    collection = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
+        text=True, capture_output=True, env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+    )
+    match = re.search(r"(\d+) tests? collected", collection.stdout)
+    collected = int(match.group(1)) if collection.returncode == 0 and match else None
     commands = [
         ([sys.executable, "-m", "pytest", "-q", "-k", "not multiworker_runtime_preserves_resume_trajectory"], True),
         ([sys.executable, "-m", "pytest", "-q", "tests/test_trainer_integration.py::test_multiworker_runtime_preserves_resume_trajectory"], True),
@@ -316,9 +424,11 @@ def run_tests(output: Path) -> dict:
         outputs.append(f"$ {' '.join(command)}\n{result.stdout}{result.stderr}")
     text = "\n".join(outputs)
     (output / "test_results.txt").write_text(text, encoding="utf-8")
-    return {"status": "PASS" if not any(returncodes) else "FAIL", "returncodes": returncodes,
+    status = "PASS" if collection.returncode == 0 and not any(returncodes) else "FAIL"
+    return {"status": status, "returncodes": [collection.returncode, *returncodes],
             "commands": [" ".join(command) for command, _ in commands],
-            "coverage": "all 161 collected tests; fork and CUDA cases isolated",
+            "collected_tests": collected, "unique_tests_passed": collected if status == "PASS" else None,
+            "coverage": f"all {collected} collected tests; fork and CUDA cases isolated",
             "tail": text.strip().splitlines()[-8:]}
 
 
@@ -337,7 +447,6 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
     current_v0 = manifest_sha256(implementation_manifest())
     v0_safe = current_v0 == V0_MANIFEST_BEFORE
     data_report = inspect_production_data(Path(config["data"]["root"]))
-    write_json(output / "data_contract_report.json", data_report)
     cuda_available = torch.cuda.is_available()
     if device_name == "cuda" and not cuda_available:
         raise RuntimeError("CUDA_NOT_AVAILABLE")
@@ -355,6 +464,8 @@ def run_development(config: dict, output: Path, device_name: str = "auto", *, te
     if device.type == "cuda":
         write_json(output / "gpu_smoke.json", gpu)
     production, imc, production_connectivity = production_smoke(config, output, device)
+    data_report["full_production_bar_audit"] = imc["full_production_bar_audit"]
+    write_json(output / "data_contract_report.json", data_report)
     write_json(output / "smoke_test.json", {"realistic_shapes": realistic, "production": production})
     write_json(output / "imc_integration_report.json", imc)
     connectivity = {

@@ -169,6 +169,14 @@ def test_v11_minute_oi_step_identity():
     assert not validity[0, 6] and validity[1:, 6].all()
 
 
+def test_v11_nonpositive_oi_is_explicitly_invalid():
+    bars = _bars(3); bars[1, 5] = 0
+    values, validity, _ = V11IMCTransform.window(bars, prior_volume=np.arange(1, 21))
+    assert values[1, 5] == values[1, 6] == 0
+    assert not validity[1, 5] and not validity[1, 6]
+    assert not validity[2, 6]
+
+
 def test_v11_minute_volume_fixed_baseline():
     bars = _bars(2)
     values, validity, origin = V11IMCTransform.window(bars, prior_volume=np.arange(1, 21))
@@ -254,13 +262,91 @@ def test_v11_history_weekly_boundary_flags(contract_dataset):
 
 
 def test_v11_history_weekly_resets_on_contract_boundary(contract_dataset):
+    arrays = contract_dataset.episode_arrays[2]
     sample = contract_dataset[contract_dataset.global_index(2, 0)]
     valid = ~sample["history_weekly_mask"]
     boundary = sample["history_weekly_contract_boundary"].bool() & valid
-    # Each segment begins at its own first weekly close/OI origin.
     assert boundary.sum() == 2
-    torch.testing.assert_close(sample["history_weekly_market"][boundary, 3], torch.zeros(2))
-    torch.testing.assert_close(sample["history_weekly_market"][boundary, 5], torch.zeros(2))
+    values = sample["history_weekly_market"][boundary]
+    for index, episode_index in enumerate((0, 1)):
+        historical = contract_dataset.episode_arrays[episode_index]
+        reference_price, reference_oi = contract_dataset.store.lifecycle_references[historical.episode.key]
+        first_week = historical.current_weekly_frame.iloc[0]
+        assert values[index, 3] == pytest.approx(np.log(first_week.close / reference_price), rel=1e-5)
+        assert values[index, 5] == pytest.approx(np.log(first_week.open_interest / reference_oi), rel=1e-5)
+    assert arrays.episode.main_start > contract_dataset.episode_arrays[1].episode.main_start
+
+
+def test_v11_history_cache_respects_shared_scaler():
+    dataset = V11ContractDataset(_make_store(), _dataset_config())
+    index = dataset.global_index(2, 0)
+    raw = dataset[index]
+    assert dataset._history_cache
+    scaler = SharedIMCScaler.fit(_scaler_population())
+    dataset.set_scaler(scaler)
+    scaled = dataset[index]
+    expected = scaler.transform(
+        raw["history_weekly_market"].numpy(), raw["history_weekly_imc_validity"].numpy(),
+    )
+    np.testing.assert_allclose(scaled["history_weekly_market"].numpy(), expected, rtol=0, atol=0)
+    assert not torch.equal(raw["history_weekly_market"], scaled["history_weekly_market"])
+    with pytest.raises(AttributeError):
+        dataset.scaler = scaler
+
+
+def test_v11_history_and_current_weekly_share_lifecycle_coordinates():
+    dataset = V11ContractDataset(_make_store(), _dataset_config())
+    historical = dataset.episode_arrays[0]
+    current_values, current_validity = V11IMCTransform.transform(
+        historical.current_weekly_frame.loc[:, BAR_COLUMNS].to_numpy(dtype=np.float64),
+        origin=historical.weekly_origin, prior_volume=historical.weekly_prior_volume,
+        previous_close=historical.weekly_previous_close, previous_oi=historical.weekly_previous_oi,
+    )
+    current = dataset.episode_arrays[2]
+    market, _, mask, validity, boundary = dataset._history(current.episode)
+    visible_market, visible_validity = market[~mask], validity[~mask]
+    assert np.flatnonzero(boundary[~mask])[1] > 0
+    # First lifecycle week is identical. Later history ends at main_end while
+    # Current memory may legally continue through anchor_end.
+    np.testing.assert_allclose(visible_market[0], current_values[0], rtol=0, atol=0)
+    np.testing.assert_array_equal(visible_validity[0], current_validity[0])
+
+
+def test_v11_context_features_are_bounded_counts_not_wall_clock():
+    dataset = V11ContractDataset(_make_store(), _dataset_config())
+    sample = dataset[dataset.global_index(0, 3)]
+    for source in ("daily", "current_weekly", "history_weekly"):
+        context = sample[f"{source}_context"][~sample[f"{source}_mask"]]
+        assert ((0 <= context) & (context <= 1)).all()
+    anchor = sample["metadata"]["anchor_position"]
+    current = dataset.episode_arrays[0].minute_frame.iloc[:anchor + 1]
+    anchor_date = current.iloc[-1].trading_date
+    expected = min(1.0, len(current.loc[current.trading_date == anchor_date]) / 512.0)
+    assert sample["daily_context"][-1, 4] == pytest.approx(expected)
+
+
+def test_v11_history_visibility_is_causal_not_role_partitioned():
+    store = _make_store()
+    store.episode_table.loc[store.episode_table.episode_id == 0, "role"] = "validation"
+    dataset = V11ContractDataset(store, _dataset_config(), role="train")
+    current = next(arrays for arrays in dataset.episode_arrays if arrays.episode.episode_id == 2)
+    history = dataset._history(current.episode)
+    assert history[4][~history[2]].sum() == 2
+
+
+def test_v11_history_truncation_boundary_uses_episode_id():
+    original = _make_store()
+    episodes = original.episode_table.copy()
+    episodes["contract_uid"] = "FG_REENTRY"
+    frames = original.frames
+    for frame in frames["FG"].values():
+        frame["contract_uid"] = "FG_REENTRY"
+    config = _dataset_config(); config["data"]["history_weekly_capacity"] = 4
+    dataset = V11ContractDataset(V11DataStore(episodes, frames), config)
+    current = next(arrays for arrays in dataset.episode_arrays if arrays.episode.episode_id == 2)
+    market, _, mask, _, boundary = dataset._history(current.episode)
+    assert market.shape[0] == 4 and (~mask).sum() == 4
+    assert boundary[~mask].sum() == 2
 
 
 def test_v11_target_never_crosses_contract(contract_dataset):

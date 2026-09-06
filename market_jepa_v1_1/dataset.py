@@ -34,6 +34,10 @@ class ContractEpisode:
     def key(self) -> tuple[str, str, int]:
         return self.commodity, self.contract_uid, self.episode_id
 
+    @property
+    def segment_key(self) -> tuple[str, int]:
+        return self.contract_uid, self.episode_id
+
 
 @dataclass
 class EpisodeArrays:
@@ -80,20 +84,36 @@ def _transform_lifecycle(
     lifecycle: pd.DataFrame,
     raw: pd.DataFrame,
     time_column: str,
+    lifecycle_reference: tuple[float, float],
+    lifecycle_start: pd.Timestamp,
 ) -> tuple[np.ndarray, np.ndarray]:
     if lifecycle.empty:
         empty = np.empty((0, len(IMC_FEATURES)), dtype=np.float32)
         return empty, empty.astype(np.bool_)
     start = pd.Timestamp(lifecycle.iloc[0][time_column])
     previous = raw.loc[raw[time_column] < start].tail(20)
+    origin_previous = raw.loc[raw[time_column] < lifecycle_start].tail(20)
     bars = lifecycle.loc[:, BAR_COLUMNS].to_numpy(dtype=np.float64)
     prior_volume = previous["volume"].to_numpy(dtype=np.float64)
     immediate = previous.iloc[-1] if not previous.empty else None
-    return V11IMCTransform.window(
-        bars, prior_volume=prior_volume,
-        previous_close=None if immediate is None else float(immediate["close"]),
-        previous_oi=None if immediate is None else float(immediate["open_interest"]),
-    )[:2]
+    previous_close = None if immediate is None else float(immediate["close"])
+    previous_oi = None if immediate is None else float(immediate["open_interest"])
+    price, oi = lifecycle_reference
+    volume_baseline, volume_valid = V11IMCTransform.volume_baseline(
+        origin_previous["volume"].to_numpy(dtype=np.float64),
+    )
+    origin = IMCOrigin(
+        price=price if np.isfinite(price) and price > 0 else 0.0,
+        open_interest=oi if np.isfinite(oi) and oi > 0 else 0.0,
+        volume_baseline=volume_baseline,
+        price_valid=bool(np.isfinite(price) and price > 0),
+        oi_valid=bool(np.isfinite(oi) and oi > 0),
+        volume_valid=volume_valid,
+    )
+    return V11IMCTransform.transform(
+        bars, origin=origin, prior_volume=prior_volume,
+        previous_close=previous_close, previous_oi=previous_oi,
+    )
 
 
 def _partial_bar(minute: pd.DataFrame, time_column: str) -> pd.DataFrame:
@@ -129,8 +149,43 @@ def _read_csv(path: Path, scale: str, contracts: set[str] | None = None) -> pd.D
     return frame
 
 
+def _read_lifecycle_references(
+    path: Path, commodity: str, episodes: pd.DataFrame,
+) -> dict[tuple[str, str, int], tuple[float, float]]:
+    """Read causal main-start Open/OI for every episode without retaining all minutes."""
+    by_contract = {
+        str(contract): list(group.itertuples(index=False))
+        for contract, group in episodes.groupby("contract_uid", sort=False)
+    }
+    best: dict[tuple[str, str, int], tuple[pd.Timestamp, float, float]] = {}
+    columns = ["contract_uid", "datetime", "trading_date", "open", "open_interest"]
+    for chunk in pd.read_csv(path, usecols=columns, chunksize=250_000):
+        chunk["contract_uid"] = chunk["contract_uid"].astype(str)
+        relevant = chunk.loc[chunk.contract_uid.isin(by_contract)].copy()
+        if relevant.empty:
+            continue
+        relevant["datetime"] = pd.to_datetime(relevant["datetime"], errors="raise")
+        relevant["trading_date"] = pd.to_datetime(relevant["trading_date"], errors="raise")
+        for contract, rows in relevant.groupby("contract_uid", sort=False):
+            for episode in by_contract[str(contract)]:
+                start, end = pd.Timestamp(episode.main_start_date), pd.Timestamp(episode.anchor_end_date)
+                eligible = rows.loc[rows.trading_date.between(start, end)]
+                if eligible.empty:
+                    continue
+                first = eligible.loc[eligible.datetime.idxmin()]
+                key = (commodity, str(contract), int(episode.episode_id))
+                candidate = (pd.Timestamp(first.datetime), float(first.open), float(first.open_interest))
+                if key not in best or candidate[0] < best[key][0]:
+                    best[key] = candidate
+    return {key: (value[1], value[2]) for key, value in best.items()}
+
+
 class V11DataStore:
-    def __init__(self, episodes: pd.DataFrame, frames: dict[str, dict[str, pd.DataFrame]], source_root: Path | None = None) -> None:
+    def __init__(
+        self, episodes: pd.DataFrame, frames: dict[str, dict[str, pd.DataFrame]],
+        source_root: Path | None = None,
+        lifecycle_references: dict[tuple[str, str, int], tuple[float, float]] | None = None,
+    ) -> None:
         required = {
             "commodity", "contract_uid", "episode_id", "main_start_date",
             "main_end_date", "anchor_end_date", "role",
@@ -155,6 +210,7 @@ class V11DataStore:
             )
             for row in table.itertuples(index=False)
         }
+        self.lifecycle_references = dict(lifecycle_references or {})
         for commodity, scales in frames.items():
             for scale, frame in scales.items():
                 if not frame.empty and set(frame["commodity"].astype(str)) != {commodity}:
@@ -164,6 +220,20 @@ class V11DataStore:
                 )
                 if unknown:
                     raise ValueError(f"{commodity}/{scale} contains unknown contracts: {sorted(unknown)[:3]}")
+        for key, episode in self.episodes.items():
+            if key in self.lifecycle_references:
+                continue
+            minute = frames.get(episode.commodity, {}).get("minute", pd.DataFrame())
+            if minute.empty:
+                continue
+            eligible = minute.loc[
+                (minute.contract_uid == episode.contract_uid)
+                & (minute.trading_date >= episode.main_start)
+                & (minute.trading_date <= episode.anchor_end)
+            ]
+            if not eligible.empty:
+                first = eligible.sort_values("datetime", kind="mergesort").iloc[0]
+                self.lifecycle_references[key] = (float(first.open), float(first.open_interest))
 
     @classmethod
     def from_directory(
@@ -178,26 +248,32 @@ class V11DataStore:
         requested = tuple(commodities)
         episodes = episodes.loc[episodes["commodity"].isin(requested)].copy()
         frames: dict[str, dict[str, pd.DataFrame]] = {}
+        lifecycle_references: dict[tuple[str, str, int], tuple[float, float]] = {}
         for commodity in requested:
             candidates = episodes.loc[episodes.commodity == commodity].sort_values("main_start_date")
             selected = candidates
             if max_contracts_per_commodity is not None:
                 selected = candidates.tail(max_contracts_per_commodity)
             minute_contracts = set(selected["contract_uid"].astype(str))
+            lifecycle_references.update(_read_lifecycle_references(
+                root / commodity / f"{commodity}_1m.csv", commodity, candidates,
+            ))
             frames[commodity] = {
                 "minute": _read_csv(root / commodity / f"{commodity}_1m.csv", "1m", minute_contracts),
                 # Daily/weekly stay complete because earlier contracts form commodity history.
                 "daily": _read_csv(root / commodity / f"{commodity}_1d.csv", "1d"),
                 "weekly": _read_csv(root / commodity / f"{commodity}_1w.csv", "1w"),
             }
-        return cls(episodes, frames, root)
+        return cls(episodes, frames, root, lifecycle_references)
 
 
 class V11ContractDataset(Dataset[dict[str, Any]]):
     """Real-contract V1.1 samples. Metadata never enters model tensors."""
 
     def __init__(self, store: V11DataStore, config: dict, *, role: str = "train", scaler: SharedIMCScaler | None = None) -> None:
-        self.store, self.config, self.role, self.scaler = store, config, role, scaler
+        self.store, self.config, self.role, self._scaler = store, config, role, None
+        if scaler is not None:
+            self.set_scaler(scaler)
         self.horizons = tuple(int(x) for x in config["data"]["horizons"])
         self.minute_capacity = int(config["data"]["minute_capacity"])
         self.daily_capacity = int(config["data"]["daily_capacity"])
@@ -211,6 +287,18 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
         self.excluded_episodes: list[dict[str, str]] = []
         self._history_cache: dict[tuple[str, str, int], tuple[np.ndarray, ...]] = {}
         self._build()
+
+    @property
+    def scaler(self) -> SharedIMCScaler | None:
+        return self._scaler
+
+    def set_scaler(self, scaler: SharedIMCScaler) -> None:
+        if not isinstance(scaler, SharedIMCScaler):
+            raise TypeError("scaler must be SharedIMCScaler")
+        SharedIMCScaler.from_dict(scaler.to_dict())
+        # History cache is raw by contract, so attaching a scaler cannot leave
+        # stale scaled/unscaled history behind.
+        self._scaler = scaler
 
     def _build(self) -> None:
         stride, max_horizon = int(self.config["data"]["anchor_stride"]), max(self.horizons)
@@ -307,12 +395,12 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
 
     def _history(self, current: ContractEpisode) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if current.key in self._history_cache:
-            return self._history_cache[current.key]
+            market, context, mask, validity, boundary = self._history_cache[current.key]
+            return self._scaled(market, validity), context, mask, validity, boundary
         cutoff = current.main_start - pd.DateOffset(years=self.history_years)
         pieces: list[tuple[ContractEpisode, pd.DataFrame]] = []
         candidates = self.store.episode_table.loc[
             (self.store.episode_table.commodity == current.commodity)
-            & (self.store.episode_table.role == current.role)
             & (pd.to_datetime(self.store.episode_table.main_start_date) < current.main_start)
         ]
         raw_daily = self.store.frames[current.commodity]["daily"]
@@ -329,11 +417,18 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
         raw_weekly_all = self.store.frames[current.commodity]["weekly"]
         for episode, weekly in pieces:
             raw = raw_weekly_all.loc[raw_weekly_all.contract_uid == episode.contract_uid].rename(columns={"week_end_date": "period_end"})
-            market, validity = _transform_lifecycle(weekly, raw, "period_end")
+            if episode.key not in self.store.lifecycle_references:
+                raise ValueError(f"missing causal main-start minute origin for historical episode {episode.key}")
+            market, validity = _transform_lifecycle(
+                weekly, raw, "period_end", self.store.lifecycle_references[episode.key],
+                episode.main_start,
+            )
             ages = ((weekly.period_end - episode.main_start).dt.days // 7).clip(lower=0).to_numpy()
             ago = ((current.main_start - weekly.period_end).dt.days // 7).clip(lower=0).to_numpy()
             context = np.column_stack((
-                ago, ages, np.zeros(len(weekly)), np.zeros(len(weekly)), weekly.trading_day_count,
+                np.clip(ago / 156.0, 0, 1), np.clip(ages / 64.0, 0, 1),
+                np.zeros(len(weekly)), np.zeros(len(weekly)),
+                np.clip(weekly.trading_day_count.to_numpy() / 5.0, 0, 1),
             )).astype(np.float32)
             boundary = np.zeros(len(weekly), dtype=np.float32)
             boundary[0] = 1.0
@@ -341,31 +436,32 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
         if market_parts:
             market = np.concatenate(market_parts); validity = np.concatenate(valid_parts)
             context = np.concatenate(context_parts); boundary = np.concatenate(boundary_parts)
-            contract_ids = np.concatenate([
-                np.full(len(weekly), episode.contract_uid, dtype=object) for episode, weekly in pieces
+            segment_ids = np.concatenate([
+                np.full(len(weekly), f"{episode.segment_key[0]}\0{episode.segment_key[1]}", dtype=object)
+                for episode, weekly in pieces
             ])
             if len(market) > self.history_weekly_capacity:
-                market, validity, context, boundary, contract_ids = (
-                    item[-self.history_weekly_capacity:] for item in (market, validity, context, boundary, contract_ids)
+                market, validity, context, boundary, segment_ids = (
+                    item[-self.history_weekly_capacity:]
+                    for item in (market, validity, context, boundary, segment_ids)
                 )
                 boundary[:] = 0
                 boundary[0] = 1
-                boundary[1:] = (contract_ids[1:] != contract_ids[:-1]).astype(np.float32)
+                boundary[1:] = (segment_ids[1:] != segment_ids[:-1]).astype(np.float32)
         else:
             market = np.empty((0, len(IMC_FEATURES)), dtype=np.float32)
             validity = np.empty_like(market, dtype=np.bool_)
             context = np.empty((0, len(WEEKLY_CONTEXT_FEATURES)), dtype=np.float32)
             boundary = np.empty(0, dtype=np.float32)
-        market, validity, mask = self._pad(self._scaled(market, validity), validity, self.history_weekly_capacity)
+        market, validity, mask = self._pad(market, validity, self.history_weekly_capacity)
         padded_context = np.zeros((self.history_weekly_capacity, len(WEEKLY_CONTEXT_FEATURES)), dtype=np.float32)
         padded_boundary = np.zeros(self.history_weekly_capacity, dtype=np.float32)
         n = int((~mask).sum())
         if n:
             padded_context[-n:] = context[-n:]
             padded_boundary[-n:] = boundary[-n:]
-        result = market, padded_context, mask, validity, padded_boundary
-        self._history_cache[current.key] = result
-        return result
+        self._history_cache[current.key] = market, padded_context, mask, validity, padded_boundary
+        return self._scaled(market, validity), padded_context, mask, validity, padded_boundary
 
     def __getitem__(self, item: int) -> dict[str, Any]:
         if item < 0:
@@ -416,13 +512,13 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
             dates = daily_rows.trading_date
             partial_flags = np.zeros(len(daily_rows), dtype=np.float32)
             partial_flags[-1] = 1.0
-            elapsed = np.zeros(len(daily_rows), dtype=np.float32)
-            elapsed[-1] = float((current_minutes.iloc[-1].datetime - current_minutes.iloc[0].datetime).total_seconds() / 60)
+            observed_fraction = np.zeros(len(daily_rows), dtype=np.float32)
+            observed_fraction[-1] = np.clip(len(current_minutes) / 512.0, 0, 1)
             context = np.column_stack((
-                (dates - arrays.episode.main_start).dt.days,
+                np.clip((dates - arrays.episode.main_start).dt.days / 256.0, 0, 1),
                 (dates <= arrays.episode.main_end).astype(np.float32),
-                np.maximum((dates - arrays.episode.main_end).dt.days, 0),
-                partial_flags, elapsed,
+                np.clip(np.maximum((dates - arrays.episode.main_end).dt.days, 0) / 21.0, 0, 1),
+                partial_flags, observed_fraction,
             )).astype(np.float32)
             daily_context[-len(context):] = context
 
@@ -457,10 +553,10 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
             partial_flags = np.zeros(len(week_rows), dtype=np.float32)
             partial_flags[-1] = 1.0
             context = np.column_stack((
-                ((anchor_date - week_rows.period_end).dt.days // 7).clip(lower=0),
-                ((week_rows.period_end - arrays.episode.main_start).dt.days // 7).clip(lower=0),
+                np.clip(((anchor_date - week_rows.period_end).dt.days // 7).clip(lower=0) / 156.0, 0, 1),
+                np.clip(((week_rows.period_end - arrays.episode.main_start).dt.days // 7).clip(lower=0) / 64.0, 0, 1),
                 np.ones(len(week_rows)),
-                partial_flags, week_rows.trading_day_count,
+                partial_flags, np.clip(week_rows.trading_day_count / 5.0, 0, 1),
             )).astype(np.float32)
             weekly_context[-len(context):] = context
 
