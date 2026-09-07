@@ -27,7 +27,9 @@ from market_jepa_v1_1.checkpoint import (
     v11_implementation_manifest,
 )
 from market_jepa_v1_1.formal_training import (
-    EPOCH_FIELDS, _filter_train_commodities_by_history, validate_formal_training_config,
+    EPOCH_FIELDS, _bar_audit_failure_description,
+    _filter_train_commodities_by_bar_audit, _filter_train_commodities_by_history,
+    validate_formal_training_config,
 )
 from market_jepa_v1_1.development import audit_history_week_eligibility
 from market_jepa_v1_1.training import V11Trainer
@@ -1092,6 +1094,33 @@ def test_v11_formal_history_filter_removes_only_zero_eligibility_commodities():
     assert [record["commodity"] for record in removed] == ["TC"]
     assert config["data"]["train_commodities"] == ["FG"]
     assert config["history_week"]["commodity_years"] == {}
+
+
+def test_v11_formal_bar_filter_records_and_removes_failed_commodity():
+    config = deepcopy(DEFAULT_V11_CONFIG)
+    config["profile"] = "debug"
+    config["data"]["train_commodities"] = ["FG", "AL"]
+    audit = {
+        "failed_commodities": ["AL"],
+        "commodities": {
+            "FG": {},
+            "AL": {
+                "invalid_price_rows": 2,
+                "negative_or_invalid_volume_rows": 0,
+                "invalid_ohlc_rows": 0,
+                "used_contracts_missing_daily_or_weekly": [],
+                "daily_field_mismatches": {"open": 0},
+                "weekly_field_mismatches": {"open": 0},
+            },
+        },
+    }
+
+    effective, removed = _filter_train_commodities_by_bar_audit(config, audit)
+
+    assert effective == ("FG",)
+    assert config["data"]["train_commodities"] == ["FG"]
+    assert removed[0]["commodity"] == "AL"
+    assert _bar_audit_failure_description(removed[0]) == "AL(invalid_price_rows=2)"
 
 
 def test_v11_checkpoint_roundtrip(trained_v11_checkpoint):

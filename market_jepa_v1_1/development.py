@@ -224,9 +224,10 @@ def inspect_production_data(
 
 def audit_full_production_bars(
     root: Path, commodities: tuple[str, ...] = TRAIN_COMMODITIES,
+    *, raise_on_failure: bool = True,
 ) -> dict:
     """Hard-gate every Train commodity's bar schema, values and cache parity."""
-    result = {}
+    result, failed_commodities = {}, []
     required = {"contract_uid", "open", "high", "low", "close", "volume", "open_interest"}
     for commodity in commodities:
         minute_path = root / commodity / f"{commodity}_1m.csv"
@@ -313,11 +314,14 @@ def audit_full_production_bars(
             or len(joined_daily) != len(minute_daily)
             or len(joined_weekly) != len(rebuilt_weekly)
         )
-        if fatal:
-            raise ValueError(f"{commodity} full production bar audit failed: {report}")
         result[commodity] = report
+        if fatal:
+            failed_commodities.append(commodity)
+            if raise_on_failure:
+                raise ValueError(f"{commodity} full production bar audit failed: {report}")
     return {
-        "status": "PASS", "commodities": result,
+        "status": "FAIL" if failed_commodities else "PASS", "commodities": result,
+        "failed_commodities": failed_commodities,
         "oi_policy": "nonpositive/nonfinite OI is never accepted as valid numeric IMC; the coordinate validity mask is false",
     }
 

@@ -189,6 +189,54 @@ def _filter_train_commodities_by_history(
     return effective, removed
 
 
+def _filter_train_commodities_by_bar_audit(
+    config: dict[str, Any], audit: dict[str, Any],
+) -> tuple[tuple[str, ...], list[dict[str, Any]]]:
+    requested = tuple(config["data"]["train_commodities"])
+    failed = set(audit["failed_commodities"])
+    removed = [
+        {"commodity": commodity, "audit": audit["commodities"][commodity]}
+        for commodity in requested if commodity in failed
+    ]
+    effective = tuple(commodity for commodity in requested if commodity not in failed)
+    if not effective:
+        raise RuntimeError("full-bar filtering removed every history-eligible Train commodity")
+    config["data"]["train_commodities"] = list(effective)
+    allowed_overrides = {*effective, str(config["data"]["held_out_commodity"])}
+    config["history_week"]["commodity_years"] = {
+        commodity: years
+        for commodity, years in config["history_week"]["commodity_years"].items()
+        if commodity in allowed_overrides
+    }
+    validate_v11_config(config)
+    return effective, removed
+
+
+def _bar_audit_failure_description(record: dict[str, Any]) -> str:
+    audit = record["audit"]
+    reasons = [
+        f"{name}={audit[name]}"
+        for name in (
+            "invalid_price_rows", "negative_or_invalid_volume_rows", "invalid_ohlc_rows",
+        )
+        if audit[name]
+    ]
+    if audit["used_contracts_missing_daily_or_weekly"]:
+        reasons.append(
+            "missing_daily_or_weekly="
+            f"{len(audit['used_contracts_missing_daily_or_weekly'])}"
+        )
+    daily_mismatches = sum(audit["daily_field_mismatches"].values())
+    weekly_mismatches = sum(audit["weekly_field_mismatches"].values())
+    if daily_mismatches:
+        reasons.append(f"daily_field_mismatches={daily_mismatches}")
+    if weekly_mismatches:
+        reasons.append(f"weekly_field_mismatches={weekly_mismatches}")
+    if not reasons:
+        reasons.append("cache_coverage_or_parity_failure")
+    return f"{record['commodity']}({','.join(reasons)})"
+
+
 def _wandb_run_name(config: dict[str, Any], trainable_params: int) -> str:
     configured = config["logging"]["wandb"].get("run_name")
     if configured:
@@ -347,6 +395,27 @@ def run_formal_training(
     }
     write_json(output / "history_week_filter.json", history_filter)
 
+    full_bars = audit_full_production_bars(
+        data_root, train_commodities, raise_on_failure=False,
+    )
+    train_commodities, bar_removed_commodities = _filter_train_commodities_by_bar_audit(
+        config, full_bars,
+    )
+    bar_removed_description = ",".join(
+        _bar_audit_failure_description(record) for record in bar_removed_commodities
+    ) or "none"
+    _append_log(
+        log_path,
+        "full-bar filter removed commodities="
+        f"{bar_removed_description}; remaining={len(train_commodities)}",
+    )
+    bar_filter = {
+        "requested_train_commodities": history_filter["effective_train_commodities"],
+        "effective_train_commodities": list(train_commodities),
+        "removed_commodities": bar_removed_commodities,
+    }
+    write_json(output / "full_bar_filter.json", bar_filter)
+
     config_yaml = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
     snapshot = output / "config_snapshot.yaml"
     if resume is not None and snapshot.exists() and snapshot.read_text(encoding="utf-8") != config_yaml:
@@ -356,13 +425,13 @@ def run_formal_training(
 
     lineage = audit_contract_lineages(data_root, output, commodities=train_commodities)
     write_json(output / "lineage_audit.json", lineage)
-    full_bars = audit_full_production_bars(data_root, train_commodities)
-    hard_gate_pass = lineage["status"] == "PASS" and full_bars["status"] == "PASS"
+    hard_gate_pass = lineage["status"] == "PASS"
     data_audit = {
         "status": "PASS" if hard_gate_pass else "FAIL",
         "root": str(data_root),
         "market_data_commodities_opened": list(requested_train_commodities),
         "history_week_filter": history_filter,
+        "full_bar_filter": bar_filter,
         "held_out_commodity": held_out_commodity,
         "held_out_bar_files_opened": False,
         "lineage": lineage,
@@ -381,7 +450,8 @@ def run_formal_training(
     included_keys = {arrays.episode.key for arrays in unscaled_train.episode_arrays}
     eligible_keys = {
         (record["commodity"], record["contract_uid"], int(record["episode_id"]))
-        for record in eligibility["contracts"] if record["eligible"]
+        for record in eligibility["contracts"]
+        if record["eligible"] and record["commodity"] in train_commodities
     }
     missing_eligible = sorted(eligible_keys - included_keys)
     if missing_eligible:
@@ -421,6 +491,7 @@ def run_formal_training(
         "implementation_sha256": implementation_sha256,
         "data_build_manifest_sha256": data_manifest_sha256,
         "requested_train_commodities": list(requested_train_commodities),
+        "history_eligible_train_commodities": history_filter["effective_train_commodities"],
         "train_commodities": list(train_commodities),
         "held_out_commodity": held_out_commodity,
         "history_years": {
