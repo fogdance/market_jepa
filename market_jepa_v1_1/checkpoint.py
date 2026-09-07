@@ -88,6 +88,8 @@ def load_v11_checkpoint(path: str | Path, map_location="cpu") -> dict:
 
 def model_from_checkpoint(state: dict) -> MarketJEPAV11:
     validate_v11_checkpoint(state)
+    if state.get("evaluation_variant", "Full") != "Full":
+        raise ValueError("control checkpoint requires explicit evaluation control model loader")
     model = MarketJEPAV11(state["architecture_config"], debug=state["v11_config"].get("profile") == "debug")
     actual = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     if state.get("trainable_parameter_count", actual) != actual:
