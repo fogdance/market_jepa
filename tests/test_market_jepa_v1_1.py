@@ -26,7 +26,9 @@ from market_jepa_v1_1.checkpoint import (
     load_v11_checkpoint, model_from_checkpoint, validate_v11_checkpoint,
     v11_implementation_manifest,
 )
-from market_jepa_v1_1.formal_training import EPOCH_FIELDS, validate_formal_training_config
+from market_jepa_v1_1.formal_training import (
+    EPOCH_FIELDS, _filter_train_commodities_by_history, validate_formal_training_config,
+)
 from market_jepa_v1_1.development import audit_history_week_eligibility
 from market_jepa_v1_1.training import V11Trainer
 
@@ -1022,6 +1024,74 @@ def test_v11_eligibility_audit_uses_only_configured_commodities(tmp_path):
     report = audit_history_week_eligibility(tmp_path, config, tmp_path / "audit")
     assert set(report["commodities"]) == {"FG"}
     assert {record["commodity"] for record in report["contracts"]} == {"FG"}
+
+
+def test_v11_eligibility_audit_reports_configured_commodity_without_train_episode(tmp_path):
+    store = _make_store(("FG",))
+    store.episode_table["role"] = "unassigned"
+    store.episode_table.to_csv(tmp_path / "contract_episodes.csv", index=False)
+    commodity_path = tmp_path / "FG"
+    commodity_path.mkdir()
+    store.frames["FG"]["weekly"].iloc[0:0].to_csv(commodity_path / "FG_1w.csv", index=False)
+    config = deepcopy(DEFAULT_V11_CONFIG)
+    config["profile"] = "debug"
+    config["data"]["train_commodities"] = ["FG"]
+    config["history_week"].update(commodity_years={}, require_full_history=False)
+
+    report = audit_history_week_eligibility(tmp_path, config, tmp_path / "audit")
+
+    assert report["status"] == "BLOCKED"
+    assert report["commodities"]["FG"]["eligible_contract_count"] == 0
+    assert report["commodities"]["FG"]["reason"] == "no train contract episodes"
+
+    overridden = audit_history_week_eligibility(
+        tmp_path, config, tmp_path / "overridden-audit", episode_role="train",
+    )
+    assert overridden["status"] == "PASS"
+    assert overridden["commodities"]["FG"]["eligible_contract_count"] == 3
+    assert overridden["episode_role_override"] == "train"
+
+
+def test_v11_data_store_can_override_selected_episode_roles_in_memory(tmp_path):
+    store = _make_store(("FG",))
+    episodes = store.episode_table.copy()
+    episodes["role"] = "unassigned"
+    episodes.to_csv(tmp_path / "contract_episodes.csv", index=False)
+    commodity_path = tmp_path / "FG"
+    commodity_path.mkdir()
+    for scale, suffix in (("minute", "1m"), ("daily", "1d"), ("weekly", "1w")):
+        store.frames["FG"][scale].to_csv(commodity_path / f"FG_{suffix}.csv", index=False)
+
+    loaded = V11DataStore.from_directory(tmp_path, ("FG",), episode_role="train")
+
+    assert set(loaded.episode_table["role"]) == {"train"}
+    assert set(pd.read_csv(tmp_path / "contract_episodes.csv")["role"]) == {"unassigned"}
+
+
+def test_v11_formal_history_filter_removes_only_zero_eligibility_commodities():
+    config = deepcopy(DEFAULT_V11_CONFIG)
+    config["profile"] = "debug"
+    config["data"]["train_commodities"] = ["FG", "TC"]
+    config["history_week"]["commodity_years"] = {"TC": 1}
+    eligibility = {
+        "commodities": {
+            "FG": {
+                "eligible_contract_count": 2, "reason": "", "total_contract_count": 3,
+                "filtered_insufficient_history_count": 1,
+            },
+            "TC": {
+                "eligible_contract_count": 0, "reason": "no train contract episodes",
+                "total_contract_count": 0, "filtered_insufficient_history_count": 0,
+            },
+        },
+    }
+
+    effective, removed = _filter_train_commodities_by_history(config, eligibility)
+
+    assert effective == ("FG",)
+    assert [record["commodity"] for record in removed] == ["TC"]
+    assert config["data"]["train_commodities"] == ["FG"]
+    assert config["history_week"]["commodity_years"] == {}
 
 
 def test_v11_checkpoint_roundtrip(trained_v11_checkpoint):

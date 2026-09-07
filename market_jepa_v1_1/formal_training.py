@@ -158,6 +158,37 @@ def _scaler_selection(dataset: V11ContractDataset, anchors_per_commodity: int) -
     }
 
 
+def _filter_train_commodities_by_history(
+    config: dict[str, Any], eligibility: dict[str, Any],
+) -> tuple[tuple[str, ...], list[dict[str, Any]]]:
+    requested = tuple(config["data"]["train_commodities"])
+    removed = [
+        {
+            "commodity": commodity,
+            "reason": eligibility["commodities"][commodity]["reason"],
+            "total_contract_count": eligibility["commodities"][commodity]["total_contract_count"],
+            "filtered_contract_count": eligibility["commodities"][commodity][
+                "filtered_insufficient_history_count"
+            ],
+        }
+        for commodity in requested
+        if eligibility["commodities"][commodity]["eligible_contract_count"] == 0
+    ]
+    removed_names = {record["commodity"] for record in removed}
+    effective = tuple(commodity for commodity in requested if commodity not in removed_names)
+    if not effective:
+        raise RuntimeError("history-week filtering removed every configured Train commodity")
+    config["data"]["train_commodities"] = list(effective)
+    allowed_overrides = {*effective, str(config["data"]["held_out_commodity"])}
+    config["history_week"]["commodity_years"] = {
+        commodity: years
+        for commodity, years in config["history_week"]["commodity_years"].items()
+        if commodity in allowed_overrides
+    }
+    validate_v11_config(config)
+    return effective, removed
+
+
 def _wandb_run_name(config: dict[str, Any], trainable_params: int) -> str:
     configured = config["logging"]["wandb"].get("run_name")
     if configured:
@@ -274,12 +305,6 @@ def run_formal_training(
     if not torch.cuda.is_available():
         raise RuntimeError("formal V1.1 requires CUDA because AMP=true; CUDA_NOT_AVAILABLE")
 
-    config_yaml = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
-    snapshot = output / "config_snapshot.yaml"
-    if resume is not None and snapshot.exists() and snapshot.read_text(encoding="utf-8") != config_yaml:
-        raise ValueError("cannot resume with a changed formal config snapshot")
-    _atomic_text(snapshot, config_yaml)
-    config_sha256 = sha256(snapshot)
     data_root = Path(config["data"]["root"])
     build_manifest = data_root / "build_manifest.json"
     if not build_manifest.is_file():
@@ -288,22 +313,56 @@ def run_formal_training(
     git_commit, git_dirty = _git_state()
     implementation = v11_implementation_manifest()
     implementation_sha256 = manifest_sha256(implementation)
-    train_commodities = tuple(config["data"]["train_commodities"])
+    requested_train_commodities = tuple(config["data"]["train_commodities"])
     held_out_commodity = str(config["data"]["held_out_commodity"])
     _append_log(
         log_path,
-        f"formal hard-gate audit started; market data scope={','.join(train_commodities)}",
+        "formal hard-gate audit started; market data scope="
+        f"{','.join(requested_train_commodities)}",
     )
+
+    eligibility = audit_history_week_eligibility(
+        data_root, config, output, episode_role="train",
+    )
+    train_commodities, removed_commodities = _filter_train_commodities_by_history(
+        config, eligibility,
+    )
+    removed_description = ",".join(
+        f"{record['commodity']}({record['reason']})" for record in removed_commodities
+    ) or "none"
+    ineligible_contract_count = sum(
+        not record["eligible"] for record in eligibility["contracts"]
+    )
+    _append_log(
+        log_path,
+        "history-week filter removed commodities="
+        f"{removed_description}; ineligible_contracts={ineligible_contract_count}; "
+        f"remaining={len(train_commodities)}",
+    )
+    history_filter = {
+        "requested_train_commodities": list(requested_train_commodities),
+        "effective_train_commodities": list(train_commodities),
+        "removed_commodities": removed_commodities,
+        "ineligible_contract_count": ineligible_contract_count,
+    }
+    write_json(output / "history_week_filter.json", history_filter)
+
+    config_yaml = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
+    snapshot = output / "config_snapshot.yaml"
+    if resume is not None and snapshot.exists() and snapshot.read_text(encoding="utf-8") != config_yaml:
+        raise ValueError("cannot resume with a changed formal config snapshot")
+    _atomic_text(snapshot, config_yaml)
+    config_sha256 = sha256(snapshot)
 
     lineage = audit_contract_lineages(data_root, output, commodities=train_commodities)
     write_json(output / "lineage_audit.json", lineage)
-    eligibility = audit_history_week_eligibility(data_root, config, output)
     full_bars = audit_full_production_bars(data_root, train_commodities)
-    hard_gate_pass = lineage["status"] == "PASS" and eligibility["status"] == "PASS" and full_bars["status"] == "PASS"
+    hard_gate_pass = lineage["status"] == "PASS" and full_bars["status"] == "PASS"
     data_audit = {
         "status": "PASS" if hard_gate_pass else "FAIL",
         "root": str(data_root),
-        "market_data_commodities_opened": list(train_commodities),
+        "market_data_commodities_opened": list(requested_train_commodities),
+        "history_week_filter": history_filter,
         "held_out_commodity": held_out_commodity,
         "held_out_bar_files_opened": False,
         "lineage": lineage,
@@ -315,7 +374,9 @@ def run_formal_training(
         raise RuntimeError("formal production data hard gate failed")
     _append_log(log_path, "formal hard-gate audit PASS")
 
-    store = V11DataStore.from_directory(data_root, train_commodities)
+    store = V11DataStore.from_directory(
+        data_root, train_commodities, episode_role="train",
+    )
     unscaled_train = V11ContractDataset(store, config, role="train", scaler=None)
     included_keys = {arrays.episode.key for arrays in unscaled_train.episode_arrays}
     eligible_keys = {
@@ -359,6 +420,7 @@ def run_formal_training(
         "config_sha256": config_sha256,
         "implementation_sha256": implementation_sha256,
         "data_build_manifest_sha256": data_manifest_sha256,
+        "requested_train_commodities": list(requested_train_commodities),
         "train_commodities": list(train_commodities),
         "held_out_commodity": held_out_commodity,
         "history_years": {

@@ -237,13 +237,18 @@ def compute_history_week_eligibility(
     commodity_years: dict[str, int] | None,
     require_full_history: bool,
     role: str,
+    expected_commodities: Iterable[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Precompute calendar-coverage eligibility before any anchor is sampled."""
     table = episodes.loc[episodes.role == role].copy()
     table["main_start_date"] = pd.to_datetime(table["main_start_date"], errors="raise")
     records: list[dict[str, Any]] = []
     summaries: dict[str, dict[str, Any]] = {}
-    commodities = sorted(set(table.commodity.astype(str)) | {key[0] for key in weekly_bounds})
+    commodities = sorted(
+        set(table.commodity.astype(str))
+        | {key[0] for key in weekly_bounds}
+        | {str(commodity) for commodity in (expected_commodities or ())}
+    )
     for commodity in commodities:
         required_years = int((commodity_years or {}).get(commodity, years))
         commodity_records = []
@@ -381,6 +386,7 @@ class V11DataStore:
         *,
         max_contracts_per_commodity: int | None = None,
         contracts_by_commodity: dict[str, set[str]] | None = None,
+        episode_role: str | None = None,
     ) -> "V11DataStore":
         if max_contracts_per_commodity is not None and contracts_by_commodity is not None:
             raise ValueError("contract limit and explicit contract selection are mutually exclusive")
@@ -388,6 +394,8 @@ class V11DataStore:
         episodes = pd.read_csv(root / "contract_episodes.csv")
         requested = tuple(commodities)
         episodes = episodes.loc[episodes["commodity"].isin(requested)].copy()
+        if episode_role is not None:
+            episodes["role"] = episode_role
         frames: dict[str, dict[str, pd.DataFrame]] = {}
         lifecycle_references: dict[tuple[str, str, int], tuple[float, float]] = {}
         for commodity in requested:

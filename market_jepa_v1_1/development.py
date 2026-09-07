@@ -322,12 +322,16 @@ def audit_full_production_bars(
     }
 
 
-def audit_history_week_eligibility(root: Path, config: dict, output: Path) -> dict:
+def audit_history_week_eligibility(
+    root: Path, config: dict, output: Path, *, episode_role: str | None = None,
+) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     frames = {}
     train_commodities = tuple(config["data"]["train_commodities"])
     episodes = pd.read_csv(root / "contract_episodes.csv")
     episodes = episodes.loc[episodes.commodity.isin(train_commodities)].copy()
+    if episode_role is not None:
+        episodes["role"] = episode_role
     for commodity in train_commodities:
         weekly = pd.read_csv(root / commodity / f"{commodity}_1w.csv")
         weekly["week_end_date"] = pd.to_datetime(weekly["week_end_date"], errors="raise")
@@ -340,6 +344,7 @@ def audit_history_week_eligibility(root: Path, config: dict, output: Path) -> di
         episodes, bounds, years=int(history["years"]),
         commodity_years={str(key): int(value) for key, value in history["commodity_years"].items()},
         require_full_history=bool(history["require_full_history"]), role="train",
+        expected_commodities=train_commodities,
     )
     order = {commodity: index for index, commodity in enumerate(train_commodities)}
     records.sort(key=lambda record: (order[record["commodity"]], record["main_start"], record["episode_id"]))
@@ -355,6 +360,7 @@ def audit_history_week_eligibility(root: Path, config: dict, output: Path) -> di
         "status": "BLOCKED" if blockers else "PASS",
         "history_week": dict(history), "commodities": summaries,
         "contracts": records, "blockers": blockers,
+        "episode_role_override": episode_role,
     }
     write_json(output / "history_week_eligibility.json", report)
     return report
