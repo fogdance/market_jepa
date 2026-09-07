@@ -30,6 +30,18 @@ MODEL_INPUT_KEYS = (
     "history_weekly_contract_boundary", "target_minute_market",
     "target_minute_imc_validity", "target_minute_mask",
 )
+PROGRESS_INTERVAL_STEPS = 200
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
 
 
 def move(value: Any, device: torch.device):
@@ -302,10 +314,13 @@ class V11Trainer:
             f"V1.1 non-finite gradient elements under amp_dtype={self.amp_dtype_name}"
         )
 
-    def _run_epoch(self, loader, training: bool) -> dict[str, float]:
+    def _run_epoch(self, loader, training: bool, *, epoch: int | None = None) -> dict[str, float]:
         self.model.train(training)
         totals = {f"prediction_loss_h{h}": 0.0 for h in self.model.horizons}
         total_loss, count = 0.0, 0
+        epoch_started = time.perf_counter()
+        optimizer_step = 0
+        optimizer_steps_total = math.ceil(len(loader) / self.accumulation) if training else 0
         step_started = time.perf_counter()
         step_samples = 0
         step_loss = 0.0
@@ -351,6 +366,7 @@ class V11Trainer:
             if training:
                 self.scaler.scale(loss / self.accumulation).backward()
                 if (index + 1) % self.accumulation == 0 or index + 1 == len(loader):
+                    optimizer_step += 1
                     self.scaler.unscale_(self.optimizer)
                     gradients_finite = self._clip_gradients_or_skip()
                     if gradients_finite and self.gradient_connectivity is None:
@@ -381,6 +397,20 @@ class V11Trainer:
                             reserved_vram_bytes=(
                                 int(torch.cuda.memory_reserved()) if self.device.type == "cuda" else None
                             ),
+                        )
+                    if (
+                        optimizer_step % PROGRESS_INTERVAL_STEPS == 0
+                        or optimizer_step == optimizer_steps_total
+                    ):
+                        elapsed = time.perf_counter() - epoch_started
+                        eta = elapsed / optimizer_step * (optimizer_steps_total - optimizer_step)
+                        print(
+                            f"epoch={epoch} step={optimizer_step}/{optimizer_steps_total} "
+                            f"{100.0 * optimizer_step / optimizer_steps_total:.1f}% "
+                            f"loss={step_loss / step_samples:.8f} "
+                            f"lr={float(self.optimizer.param_groups[0]['lr']):.8g} "
+                            f"elapsed={_format_duration(elapsed)} ETA={_format_duration(eta)}",
+                            flush=True,
                         )
                     step_started = time.perf_counter()
                     step_samples = 0
@@ -444,7 +474,7 @@ class V11Trainer:
             global_step_before = self.global_step
             skipped_before = self.skipped_optimizer_steps
             self.sampler.set_epoch(epoch)
-            train = self._run_epoch(self.train_loader, True)
+            train = self._run_epoch(self.train_loader, True, epoch=epoch)
             validation = None if self.validation_loader is None else self._run_epoch(self.validation_loader, False)
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
