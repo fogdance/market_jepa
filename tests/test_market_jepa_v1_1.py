@@ -28,8 +28,8 @@ from market_jepa_v1_1.checkpoint import (
 )
 from market_jepa_v1_1.formal_training import (
     EPOCH_FIELDS, _bar_audit_failure_description,
-    _filter_train_commodities_by_bar_audit, _filter_train_commodities_by_history,
-    validate_formal_training_config,
+    _filter_train_commodities_by_bar_audit, _filter_train_commodities_by_dataset,
+    _filter_train_commodities_by_history, validate_formal_training_config,
 )
 from market_jepa_v1_1.development import audit_history_week_eligibility
 from market_jepa_v1_1.training import V11Trainer
@@ -1121,6 +1121,33 @@ def test_v11_formal_bar_filter_records_and_removes_failed_commodity():
     assert config["data"]["train_commodities"] == ["FG"]
     assert removed[0]["commodity"] == "AL"
     assert _bar_audit_failure_description(removed[0]) == "AL(invalid_price_rows=2)"
+
+
+def test_v11_formal_dataset_filter_keeps_commodity_with_valid_anchors():
+    config = deepcopy(DEFAULT_V11_CONFIG)
+    config["profile"] = "debug"
+    config["data"]["train_commodities"] = ["BB", "TC"]
+    dataset = SimpleNamespace(
+        train_commodities=("BB", "TC"),
+        hierarchy={"BB": [0]},
+        excluded_episodes=[
+            {"commodity": "BB", "contract_uid": "BB202102", "episode_id": "1",
+             "reason": "missing_minute_bars"},
+            {"commodity": "TC", "contract_uid": "TC201604", "episode_id": "1",
+             "reason": "no_all_horizon_anchor"},
+        ],
+    )
+
+    effective, removed = _filter_train_commodities_by_dataset(config, dataset)
+
+    assert effective == ("BB",)
+    assert config["data"]["train_commodities"] == ["BB"]
+    assert dataset.train_commodities == ("BB",)
+    assert removed == [{
+        "commodity": "TC",
+        "reason": "no valid all-horizon anchors",
+        "excluded_episode_reasons": {"no_all_horizon_anchor": 1},
+    }]
 
 
 def test_v11_checkpoint_roundtrip(trained_v11_checkpoint):

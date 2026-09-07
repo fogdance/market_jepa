@@ -499,17 +499,27 @@ class V11ContractDataset(Dataset[dict[str, Any]]):
                 continue
             scales = self.store.frames.get(episode.commodity)
             if scales is None:
+                self.excluded_episodes.append({
+                    "commodity": episode.commodity, "contract_uid": episode.contract_uid,
+                    "episode_id": str(episode.episode_id), "reason": "missing_commodity_frames",
+                })
                 continue
             minute = scales["minute"].loc[scales["minute"].contract_uid == episode.contract_uid].copy()
             if minute.empty:
-                self.excluded_episodes.append({"contract_uid": episode.contract_uid, "reason": "missing_minute_bars"})
+                self.excluded_episodes.append({
+                    "commodity": episode.commodity, "contract_uid": episode.contract_uid,
+                    "episode_id": str(episode.episode_id), "reason": "missing_minute_bars",
+                })
                 continue
             minute = minute.sort_values("datetime", kind="mergesort").reset_index(drop=True)
             legal = minute["trading_date"].between(episode.main_start, episode.anchor_end).to_numpy()
             positions = np.flatnonzero(legal)
             positions = positions[positions + max_horizon < len(minute)][::stride]
             if not len(positions):
-                self.excluded_episodes.append({"contract_uid": episode.contract_uid, "reason": "no_all_horizon_anchor"})
+                self.excluded_episodes.append({
+                    "commodity": episode.commodity, "contract_uid": episode.contract_uid,
+                    "episode_id": str(episode.episode_id), "reason": "no_all_horizon_anchor",
+                })
                 continue
             daily_raw = scales["daily"].loc[scales["daily"].contract_uid == episode.contract_uid].copy()
             daily = daily_raw.loc[daily_raw["trading_date"].between(episode.main_start, episode.anchor_end)].copy()

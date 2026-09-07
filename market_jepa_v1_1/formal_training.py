@@ -178,14 +178,7 @@ def _filter_train_commodities_by_history(
     effective = tuple(commodity for commodity in requested if commodity not in removed_names)
     if not effective:
         raise RuntimeError("history-week filtering removed every configured Train commodity")
-    config["data"]["train_commodities"] = list(effective)
-    allowed_overrides = {*effective, str(config["data"]["held_out_commodity"])}
-    config["history_week"]["commodity_years"] = {
-        commodity: years
-        for commodity, years in config["history_week"]["commodity_years"].items()
-        if commodity in allowed_overrides
-    }
-    validate_v11_config(config)
+    _set_effective_train_commodities(config, effective)
     return effective, removed
 
 
@@ -201,6 +194,13 @@ def _filter_train_commodities_by_bar_audit(
     effective = tuple(commodity for commodity in requested if commodity not in failed)
     if not effective:
         raise RuntimeError("full-bar filtering removed every history-eligible Train commodity")
+    _set_effective_train_commodities(config, effective)
+    return effective, removed
+
+
+def _set_effective_train_commodities(
+    config: dict[str, Any], effective: tuple[str, ...],
+) -> None:
     config["data"]["train_commodities"] = list(effective)
     allowed_overrides = {*effective, str(config["data"]["held_out_commodity"])}
     config["history_week"]["commodity_years"] = {
@@ -209,6 +209,33 @@ def _filter_train_commodities_by_bar_audit(
         if commodity in allowed_overrides
     }
     validate_v11_config(config)
+
+
+def _filter_train_commodities_by_dataset(
+    config: dict[str, Any], dataset: V11ContractDataset,
+) -> tuple[tuple[str, ...], list[dict[str, Any]]]:
+    requested = tuple(config["data"]["train_commodities"])
+    hierarchy = dataset.hierarchy
+    removed = []
+    for commodity in requested:
+        if commodity in hierarchy:
+            continue
+        reasons: dict[str, int] = {}
+        for exclusion in dataset.excluded_episodes:
+            if exclusion.get("commodity") == commodity:
+                reason = str(exclusion["reason"])
+                reasons[reason] = reasons.get(reason, 0) + 1
+        removed.append({
+            "commodity": commodity,
+            "reason": "no valid all-horizon anchors",
+            "excluded_episode_reasons": reasons,
+        })
+    removed_names = {record["commodity"] for record in removed}
+    effective = tuple(commodity for commodity in requested if commodity not in removed_names)
+    if not effective:
+        raise RuntimeError("dataset filtering removed every bar-valid Train commodity")
+    _set_effective_train_commodities(config, effective)
+    dataset.train_commodities = effective
     return effective, removed
 
 
@@ -416,6 +443,56 @@ def run_formal_training(
     }
     write_json(output / "full_bar_filter.json", bar_filter)
 
+    store = V11DataStore.from_directory(
+        data_root, train_commodities, episode_role="train",
+    )
+    unscaled_train = V11ContractDataset(store, config, role="train", scaler=None)
+    included_keys = {arrays.episode.key for arrays in unscaled_train.episode_arrays}
+    eligible_keys = {
+        (record["commodity"], record["contract_uid"], int(record["episode_id"]))
+        for record in eligibility["contracts"]
+        if record["eligible"] and record["commodity"] in train_commodities
+    }
+    missing_eligible = sorted(eligible_keys - included_keys)
+    excluded_by_key = {
+        (
+            str(record["commodity"]), str(record["contract_uid"]),
+            int(record["episode_id"]),
+        ): record
+        for record in unscaled_train.excluded_episodes
+    }
+    missing_eligible_records = [
+        excluded_by_key.get(key, {
+            "commodity": key[0], "contract_uid": key[1],
+            "episode_id": str(key[2]), "reason": "not_constructed",
+        })
+        for key in missing_eligible
+    ]
+    train_commodities, dataset_removed_commodities = _filter_train_commodities_by_dataset(
+        config, unscaled_train,
+    )
+    missing_reasons: dict[str, int] = {}
+    for record in missing_eligible_records:
+        reason = str(record["reason"])
+        missing_reasons[reason] = missing_reasons.get(reason, 0) + 1
+    dataset_removed_description = ",".join(
+        record["commodity"] for record in dataset_removed_commodities
+    ) or "none"
+    _append_log(
+        log_path,
+        "dataset filter excluded history-eligible episodes="
+        f"{len(missing_eligible_records)} reasons={missing_reasons}; "
+        f"removed commodities={dataset_removed_description}; remaining={len(train_commodities)}",
+    )
+    dataset_filter = {
+        "requested_train_commodities": bar_filter["effective_train_commodities"],
+        "effective_train_commodities": list(train_commodities),
+        "excluded_history_eligible_episodes": missing_eligible_records,
+        "excluded_history_eligible_reason_counts": missing_reasons,
+        "removed_commodities": dataset_removed_commodities,
+    }
+    write_json(output / "dataset_filter.json", dataset_filter)
+
     config_yaml = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
     snapshot = output / "config_snapshot.yaml"
     if resume is not None and snapshot.exists() and snapshot.read_text(encoding="utf-8") != config_yaml:
@@ -432,6 +509,7 @@ def run_formal_training(
         "market_data_commodities_opened": list(requested_train_commodities),
         "history_week_filter": history_filter,
         "full_bar_filter": bar_filter,
+        "dataset_filter": dataset_filter,
         "held_out_commodity": held_out_commodity,
         "held_out_bar_files_opened": False,
         "lineage": lineage,
@@ -443,19 +521,6 @@ def run_formal_training(
         raise RuntimeError("formal production data hard gate failed")
     _append_log(log_path, "formal hard-gate audit PASS")
 
-    store = V11DataStore.from_directory(
-        data_root, train_commodities, episode_role="train",
-    )
-    unscaled_train = V11ContractDataset(store, config, role="train", scaler=None)
-    included_keys = {arrays.episode.key for arrays in unscaled_train.episode_arrays}
-    eligible_keys = {
-        (record["commodity"], record["contract_uid"], int(record["episode_id"]))
-        for record in eligibility["contracts"]
-        if record["eligible"] and record["commodity"] in train_commodities
-    }
-    missing_eligible = sorted(eligible_keys - included_keys)
-    if missing_eligible:
-        raise RuntimeError(f"eligible contracts failed dataset construction: {missing_eligible[:5]}")
     scaler_selection = _scaler_selection(unscaled_train, scaler_anchors_per_commodity)
     shared_scaler = fit_v11_shared_scaler(unscaled_train, scaler_anchors_per_commodity)
     if set(shared_scaler.fitted_commodities) != set(train_commodities):
