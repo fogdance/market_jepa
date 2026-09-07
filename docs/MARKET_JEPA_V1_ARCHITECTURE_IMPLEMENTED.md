@@ -12,10 +12,10 @@ V1 implements Cross-Scale Conditional Representation at width 256. It is an arch
 - Development: `develop_market_jepa_v1.py`. It runs full-width synthetic B=2 and B=8 steps, a bounded JM Train smoke, and the complete pytest suite. It refuses to overwrite an existing final report; use a new output directory for a rerun.
 - Checkpoint: `load_v1_checkpoint` validates version/config/schema, and `model_from_checkpoint` uses strict state loading. `V1Trainer.resume` restores optimizer, scheduler, scaler, RNG, sampler epoch and step with source/config/normalization/implementation checks.
 
-V0's Python implementation and configuration files are unchanged. Its manifest enumerates `market_jepa/**/*.py` and top-level `configs/*.yaml`; therefore V1 is an independent package and its YAML lives in a config subdirectory. This preserves the pre-development V0 manifest:
+V0's Python implementation and configuration files are unchanged. Its provenance manifest also includes `pyproject.toml` and `uv.lock`; adding the observability-only W&B SDK dependency refreshed that infrastructure-inclusive checksum without changing V0 model/data/training code:
 
 ```text
-4e1b548e27dca817365a62b1d634d1e3ca701f7f0461037610e6e1b7448548a5
+fc3343491e35c69ebc2d6bed04d91383b82ade6694a4c77483c4e8791f4e271e
 ```
 
 V1 has its own manifest including V1 code/config/entrypoint and the reused V0 implementation. No historical V0 checkpoint was migrated or partially loaded into V1.

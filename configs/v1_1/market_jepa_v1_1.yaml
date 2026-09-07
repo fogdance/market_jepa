@@ -69,3 +69,14 @@ development:
   batch_size: 2
   scaler_anchors_per_commodity: 32
   anchors_per_contract: 16
+logging:
+  wandb:
+    enabled: true
+    mode: online
+    project: market-jepa
+    group: v1.1-formal
+    entity: null
+    run_name: null
+    log_every_optimizer_steps: 50
+    watch_model: false
+    upload_checkpoint: false

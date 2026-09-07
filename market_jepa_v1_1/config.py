@@ -118,6 +118,19 @@ DEFAULT_V11_CONFIG: dict[str, Any] = {
         "scaler_anchors_per_commodity": 32,
         "anchors_per_contract": 16,
     },
+    "logging": {
+        "wandb": {
+            "enabled": True,
+            "mode": "online",
+            "project": "market-jepa",
+            "group": "v1.1-formal",
+            "entity": None,
+            "run_name": None,
+            "log_every_optimizer_steps": 50,
+            "watch_model": False,
+            "upload_checkpoint": False,
+        },
+    },
 }
 
 
@@ -230,6 +243,35 @@ def validate_v11_config(config: dict[str, Any]) -> None:
         raise ValueError("development optimizer_steps must be 100-500")
     if development["batch_size"] not in {2, 8}:
         raise ValueError("development batch_size must be 2 or 8")
+    logging = config.get("logging")
+    if not isinstance(logging, dict) or set(logging) != {"wandb"}:
+        raise ValueError("V1.1 logging requires exactly a wandb section")
+    wandb = logging["wandb"]
+    expected_wandb = DEFAULT_V11_CONFIG["logging"]["wandb"]
+    if not isinstance(wandb, dict):
+        raise ValueError("V1.1 logging.wandb must be a mapping")
+    if set(wandb) != set(expected_wandb):
+        raise ValueError(
+            f"V1.1 logging.wandb keys differ: {sorted(set(wandb) ^ set(expected_wandb))}"
+        )
+    if not isinstance(wandb["enabled"], bool):
+        raise ValueError("logging.wandb.enabled must be boolean")
+    if wandb["mode"] not in {"online", "offline", "disabled"}:
+        raise ValueError("logging.wandb.mode must be online, offline, or disabled")
+    for name in ("project", "group"):
+        if not isinstance(wandb[name], str) or not wandb[name]:
+            raise ValueError(f"logging.wandb.{name} must be a nonempty string")
+    for name in ("entity", "run_name"):
+        if wandb[name] is not None and (not isinstance(wandb[name], str) or not wandb[name]):
+            raise ValueError(f"logging.wandb.{name} must be null or a nonempty string")
+    interval = wandb["log_every_optimizer_steps"]
+    if isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0:
+        raise ValueError("logging.wandb.log_every_optimizer_steps must be a positive integer")
+    for name in ("watch_model", "upload_checkpoint"):
+        if not isinstance(wandb[name], bool):
+            raise ValueError(f"logging.wandb.{name} must be boolean")
+        if wandb[name]:
+            raise ValueError(f"logging.wandb.{name}=true is not supported in V1.1")
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

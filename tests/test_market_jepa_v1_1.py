@@ -1228,3 +1228,35 @@ def test_v11_nonfinite_gradient_is_deferred_to_float16_grad_scaler():
     trainer.grad_scaler_enabled = True
     trainer.amp_dtype_name = "float16"
     assert trainer._clip_gradients_or_skip() is False
+
+
+def test_v11_trainer_emits_successful_optimizer_step_metrics(tmp_path):
+    class StepRecorder:
+        active = True
+
+        def __init__(self):
+            self.values = []
+
+        def log_step(self, **value):
+            self.values.append(value)
+
+    config = _trainer_config(tmp_path)
+    dataset = _TrainerDataset()
+    recorder = StepRecorder()
+    trainer = V11Trainer(
+        MarketJEPAV11(config["model"], debug=True), config, dataset, torch.device("cpu"),
+        samples_per_epoch=2, data_manifest_sha256="synthetic-data",
+        step_logger=recorder, wandb_run_id="tracking-id",
+    )
+    history = trainer.fit()
+    assert len(recorder.values) == 1
+    step = recorder.values[0]
+    assert step["global_step"] == 1
+    assert step["samples"] == 2
+    assert step["loss"] == pytest.approx(history[0]["train_loss"])
+    for horizon in (16, 64, 256):
+        assert step[f"h{horizon}_loss"] == pytest.approx(
+            history[0][f"prediction_loss_h{horizon}"]
+        )
+    state = load_v11_checkpoint(tmp_path / "last.pt")
+    assert state["wandb_run_id"] == "tracking-id"

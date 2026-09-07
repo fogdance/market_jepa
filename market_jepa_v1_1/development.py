@@ -34,7 +34,8 @@ from .model import MarketJEPAV11
 from .training import V11Trainer, assert_all_trainable_gradients, model_inputs
 
 
-V0_MANIFEST_BEFORE = "4e1b548e27dca817365a62b1d634d1e3ca701f7f0461037610e6e1b7448548a5"
+# V0 provenance includes pyproject/uv.lock; refreshed only for the W&B SDK dependency.
+V0_MANIFEST_BEFORE = "fc3343491e35c69ebc2d6bed04d91383b82ade6694a4c77483c4e8791f4e271e"
 
 
 def write_json(path: Path, value) -> None:

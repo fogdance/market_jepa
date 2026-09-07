@@ -74,6 +74,10 @@ def validate_v11_checkpoint(state: dict) -> None:
         or state["trainable_parameter_count"] <= 0
     ):
         raise ValueError("invalid V1.1 checkpoint trainable parameter count")
+    if "wandb_run_id" in state and state["wandb_run_id"] is not None and (
+        not isinstance(state["wandb_run_id"], str) or not state["wandb_run_id"]
+    ):
+        raise ValueError("invalid V1.1 checkpoint wandb_run_id")
 
 
 def load_v11_checkpoint(path: str | Path, map_location="cpu") -> dict:

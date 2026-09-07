@@ -28,6 +28,7 @@ from .development import (
 )
 from .model import MarketJEPAV11
 from .training import V11Trainer
+from .wandb_logging import V11WandbLogger, read_persisted_run_id
 
 
 FORMAL_OUTPUT = Path("artifacts/training/v1_1_formal")
@@ -156,6 +157,77 @@ def _scaler_selection(dataset: V11ContractDataset, anchors_per_commodity: int) -
         )
         for commodity in dataset.train_commodities
     }
+
+
+def _wandb_run_name(config: dict[str, Any], trainable_params: int) -> str:
+    configured = config["logging"]["wandb"].get("run_name")
+    if configured:
+        return str(configured)
+    size = model_size_from_config(config["model"])
+    millions = trainable_params / 1_000_000
+    return (
+        f"v1.1-{size}-{millions:.2f}M-"
+        f"{int(config['training']['max_epochs'])}E-seed{int(config['training']['seed'])}"
+    )
+
+
+def _wandb_metadata(
+    config: dict[str, Any], counts: dict[str, Any], protocol: dict[str, Any],
+) -> dict[str, Any]:
+    model = config["model"]
+    training = config["training"]
+    return {
+        "design_version": "V1.1",
+        "model_size": model_size_from_config(model),
+        "trainable_params": int(counts["v1_1_trainable"]),
+        "ema_params": int(counts["v1_1_ema"]),
+        "d_model": int(model["d_model"]),
+        "heads": int(model["num_heads"]),
+        "ffn_dim": int(model["ffn_dim"]),
+        "minute_layers": int(model["minute_layers"]),
+        "commodity_state_tokens": int(model["commodity_state_tokens"]),
+        "contract_state_tokens": int(model["contract_state_tokens"]),
+        "belief_tokens": int(model["belief_tokens"]),
+        "minute_capacity": int(model["minute_capacity"]),
+        "daily_capacity": int(model["daily_capacity"]),
+        "current_weekly_capacity": int(model["current_weekly_capacity"]),
+        "historical_weekly_capacity": int(model["history_weekly_capacity"]),
+        "train_commodities": list(protocol["train_commodities"]),
+        "heldout_commodity": protocol["held_out_commodity"],
+        "history_years": dict(protocol["history_years"]),
+        "eligible_contracts_by_commodity": dict(protocol["eligible_contract_count"]),
+        "anchors_by_commodity": dict(protocol["valid_anchors"]),
+        "total_anchors": int(protocol["total_train_anchors"]),
+        "sampler": protocol["sampler"],
+        "batch_size": int(training["batch_size"]),
+        "gradient_accumulation": int(training["gradient_accumulation"]),
+        "effective_batch_size": int(training["batch_size"] * training["gradient_accumulation"]),
+        "max_epochs": int(training["max_epochs"]),
+        "seed": int(training["seed"]),
+        "optimizer": training["optimizer"],
+        "learning_rate": float(training["learning_rate"]),
+        "weight_decay": float(training["weight_decay"]),
+        "gradient_clip": float(training["gradient_clip_norm"]),
+        "amp": bool(training["amp"]),
+        "amp_dtype": training["amp_dtype"],
+        "ema_tau": float(training["ema_tau"]),
+        "checkpoint_policy": protocol["checkpoint_policy"],
+        "git_commit": protocol["git_commit"],
+        "data_manifest_sha256": protocol["data_build_manifest_sha256"],
+        "implementation_sha256": protocol["implementation_sha256"],
+    }
+
+
+def _wandb_tags(config: dict[str, Any], trainable_params: int) -> list[str]:
+    dtype = str(config["training"]["amp_dtype"])
+    precision = {"bfloat16": "BF16", "float16": "FP16"}.get(dtype, dtype.upper())
+    return [
+        "formal",
+        "v1.1",
+        model_size_from_config(config["model"]),
+        f"{round(trainable_params / 1_000_000)}M",
+        precision,
+    ]
 
 
 def _final_summary_markdown(summary: dict[str, Any]) -> str:
@@ -317,6 +389,14 @@ def run_formal_training(
         "official_endpoint": "epoch 49 last.pt",
         "HELD_OUT_READ_DURING_TRAINING": False,
         "RB_READ_DURING_TRAINING": False if held_out_commodity == "RB" else None,
+        "wandb": {
+            "enabled": config["logging"]["wandb"]["enabled"],
+            "mode": config["logging"]["wandb"]["mode"],
+            "project": config["logging"]["wandb"]["project"],
+            "group": config["logging"]["wandb"]["group"],
+            "log_every_optimizer_steps": config["logging"]["wandb"]["log_every_optimizer_steps"],
+            "diagnostic_only": True,
+        },
     }
     write_json(output / "protocol.json", protocol)
     checkpoint_policy = {
@@ -335,17 +415,39 @@ def run_formal_training(
 
     configure_determinism(int(config["training"]["seed"]))
     model = MarketJEPAV11(config["model"])
+    wandb_logger = V11WandbLogger(
+        config["logging"]["wandb"], output,
+        warning=lambda message: _append_log(log_path, f"WARNING {message}"),
+        info=lambda message: _append_log(log_path, message),
+    )
     trainer = V11Trainer(
         model, config, train_dataset, torch.device("cuda"),
         validation_dataset=None, samples_per_epoch=len(train_dataset),
-        data_manifest_sha256=data_manifest_sha256,
+        data_manifest_sha256=data_manifest_sha256, step_logger=wandb_logger,
     )
     resumed = resume is not None
+    resume_state = None
     if resumed:
-        trainer.resume(load_v11_checkpoint(Path(resume)))
+        resume_state = load_v11_checkpoint(Path(resume))
+        trainer.resume(resume_state)
         _append_log(log_path, f"resume accepted: {resume}; start_epoch={trainer.start_epoch}")
 
+    resume_run_id = (
+        resume_state.get("wandb_run_id") if resume_state is not None else None
+    ) or (read_persisted_run_id(output) if resumed else None)
+    run_name = _wandb_run_name(config, int(counts["v1_1_trainable"]))
+    run_id = wandb_logger.init(
+        _wandb_metadata(config, counts, protocol),
+        run_name=run_name,
+        tags=_wandb_tags(config, int(counts["v1_1_trainable"])),
+        resume_run_id=resume_run_id,
+        resumed=resumed,
+    )
+    if run_id:
+        trainer.wandb_run_id = run_id
+
     def epoch_complete(record: dict) -> None:
+        # Local files are the source of truth and are committed before W&B mirrors them.
         _save_epoch_outputs(output, trainer.history)
         _append_log(
             log_path,
@@ -353,10 +455,15 @@ def run_formal_training(
             "h64={prediction_loss_h64:.8f} h256={prediction_loss_h256:.8f} "
             "global_step={global_step} elapsed_seconds={elapsed_seconds:.3f}".format(**record),
         )
+        wandb_logger.log_epoch(record, samples_per_epoch=len(train_dataset))
 
     torch.cuda.reset_peak_memory_stats()
     invocation_started = time.perf_counter()
-    history = trainer.fit(epoch_callback=epoch_complete)
+    try:
+        history = trainer.fit(epoch_callback=epoch_complete)
+    except BaseException as error:
+        wandb_logger.fail(error)
+        raise
     torch.cuda.synchronize()
     invocation_elapsed = time.perf_counter() - invocation_started
     _save_epoch_outputs(output, history)
@@ -454,4 +561,16 @@ def run_formal_training(
     write_json(output / "final_summary.json", summary)
     _atomic_text(output / "final_summary.md", _final_summary_markdown(summary))
     _append_log(log_path, f"training finished status={summary['status']}")
+    wandb_logger.finish({
+        "status": summary["status"],
+        "final_epoch": summary["final_epoch"],
+        "final_global_step": summary["global_step"],
+        "final_loss": final["train_loss"],
+        "final_h16_loss": final["prediction_loss_h16"],
+        "final_h64_loss": final["prediction_loss_h64"],
+        "final_h256_loss": final["prediction_loss_h256"],
+        "total_training_seconds": total_elapsed,
+        "peak_vram_gb": peak_allocated / (1024 ** 3),
+        "checkpoint_sha256": checkpoint_sha256,
+    })
     return summary

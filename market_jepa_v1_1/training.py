@@ -137,6 +137,7 @@ class V11Trainer:
         self, model, config: dict, train_dataset: V11ContractDataset, device: torch.device,
         *, validation_dataset: V11ContractDataset | None = None,
         samples_per_epoch: int | None = None, data_manifest_sha256: str = "",
+        step_logger: Any | None = None, wandb_run_id: str | None = None,
     ) -> None:
         validate_v11_config(config)
         if train_dataset.scaler is None:
@@ -188,6 +189,9 @@ class V11Trainer:
         self.amp_calibration: list[dict[str, float | bool]] = []
         self.global_step = 0; self.start_epoch = 0; self.history: list[dict] = []
         self.skipped_optimizer_steps = 0
+        self.last_grad_norm: float | None = None
+        self.step_logger = step_logger
+        self.wandb_run_id = wandb_run_id
         self.consecutive_amp_overflows = 0
         self.max_consecutive_amp_overflows = 8
         self.gradient_connectivity: dict | None = None
@@ -272,6 +276,7 @@ class V11Trainer:
             grads, norm_type=2.0, error_if_nonfinite=False,
         )
         if torch.isfinite(total_norm):
+            self.last_grad_norm = float(total_norm.detach())
             torch.nn.utils.clip_grads_with_norm_(
                 parameters, self.config["training"]["gradient_clip_norm"], total_norm,
             )
@@ -281,6 +286,7 @@ class V11Trainer:
             stable_norm = _stable_total_norm_fp64(parameters)
             if not torch.isfinite(stable_norm):
                 raise FloatingPointError("V1.1 FP64 gradient norm is non-finite")
+            self.last_grad_norm = float(stable_norm.detach())
             torch.nn.utils.clip_grads_with_norm_(
                 parameters, self.config["training"]["gradient_clip_norm"], stable_norm,
             )
@@ -290,6 +296,7 @@ class V11Trainer:
             # unscale_ has already recorded found_inf for GradScaler. Do not clip
             # non-finite gradients; scaler.step() will skip the optimizer update and
             # scaler.update() will lower the scale.
+            self.last_grad_norm = None
             return False
         raise FloatingPointError(
             f"V1.1 non-finite gradient elements under amp_dtype={self.amp_dtype_name}"
@@ -299,6 +306,10 @@ class V11Trainer:
         self.model.train(training)
         totals = {f"prediction_loss_h{h}": 0.0 for h in self.model.horizons}
         total_loss, count = 0.0, 0
+        step_started = time.perf_counter()
+        step_samples = 0
+        step_loss = 0.0
+        step_horizons = {horizon: 0.0 for horizon in self.model.horizons}
         if training:
             self.optimizer.zero_grad(set_to_none=True)
         for index, raw in enumerate(loader):
@@ -326,6 +337,17 @@ class V11Trainer:
                 )
             if not torch.isfinite(loss):
                 raise FloatingPointError("V1.1 JEPA loss is nonfinite")
+            size = kwargs["minute_market"].shape[0]
+            loss_value = float(loss.detach())
+            horizon_values = {
+                horizon: float(metrics[f"prediction_loss_h{horizon}"])
+                for horizon in self.model.horizons
+            }
+            if training:
+                step_samples += size
+                step_loss += loss_value * size
+                for horizon in self.model.horizons:
+                    step_horizons[horizon] += horizon_values[horizon] * size
             if training:
                 self.scaler.scale(loss / self.accumulation).backward()
                 if (index + 1) % self.accumulation == 0 or index + 1 == len(loader):
@@ -338,10 +360,35 @@ class V11Trainer:
                         raise FloatingPointError(
                             "V1.1 GradScaler failed to skip an optimizer step with non-finite gradients"
                         )
-            size = kwargs["minute_market"].shape[0]
-            total_loss += float(loss.detach()) * size; count += size
+                    if (
+                        step_succeeded and self.step_logger is not None
+                        and getattr(self.step_logger, "active", True)
+                    ):
+                        self.step_logger.log_step(
+                            global_step=self.global_step,
+                            loss=step_loss / step_samples,
+                            h16_loss=step_horizons[16] / step_samples,
+                            h64_loss=step_horizons[64] / step_samples,
+                            h256_loss=step_horizons[256] / step_samples,
+                            learning_rate=float(self.optimizer.param_groups[0]["lr"]),
+                            grad_norm=self.last_grad_norm,
+                            skipped_optimizer_steps=self.skipped_optimizer_steps,
+                            step_seconds=time.perf_counter() - step_started,
+                            samples=step_samples,
+                            allocated_vram_bytes=(
+                                int(torch.cuda.memory_allocated()) if self.device.type == "cuda" else None
+                            ),
+                            reserved_vram_bytes=(
+                                int(torch.cuda.memory_reserved()) if self.device.type == "cuda" else None
+                            ),
+                        )
+                    step_started = time.perf_counter()
+                    step_samples = 0
+                    step_loss = 0.0
+                    step_horizons = {horizon: 0.0 for horizon in self.model.horizons}
+            total_loss += loss_value * size; count += size
             for horizon in self.model.horizons:
-                totals[f"prediction_loss_h{horizon}"] += float(metrics[f"prediction_loss_h{horizon}"]) * size
+                totals[f"prediction_loss_h{horizon}"] += horizon_values[horizon] * size
         return {"loss": total_loss / count, **{key: value / count for key, value in totals.items()}}
 
     def _state(self, epoch: int) -> dict:
@@ -377,6 +424,7 @@ class V11Trainer:
             "amp_dtype": self.amp_dtype_name,
             "grad_scaler_enabled": self.grad_scaler_enabled,
             "amp_calibration": self.amp_calibration,
+            "wandb_run_id": self.wandb_run_id,
             "history": self.history, "gradient_connectivity": self.gradient_connectivity,
         }
 
@@ -455,3 +503,4 @@ class V11Trainer:
         self.daily_truncated_tokens = int(state["daily_truncated_tokens"])
         self.gradient_connectivity = state.get("gradient_connectivity")
         self.amp_calibration = list(state.get("amp_calibration", [])); self.amp_calibrated = True
+        self.wandb_run_id = state.get("wandb_run_id")
