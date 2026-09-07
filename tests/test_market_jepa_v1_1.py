@@ -1047,3 +1047,184 @@ def test_v11_resume_roundtrip(trained_v11_checkpoint):
     assert restored.start_epoch == 1
     assert restored.history == trainer.history
     assert restored.sampler.state_dict() == trainer.sampler.state_dict()
+
+
+def test_v11_formal_amp_dtype_is_bfloat16():
+    config = deepcopy(DEFAULT_V11_CONFIG)
+    assert config["training"]["amp"] is True
+    assert config["training"]["amp_dtype"] == "bfloat16"
+    validate_v11_config(config)
+    validate_formal_training_config(config)
+    changed = deepcopy(config)
+    changed["training"]["amp_dtype"] = "float16"
+    with pytest.raises(ValueError, match="training configuration mismatch"):
+        validate_formal_training_config(changed)
+
+
+def test_v11_jepa_loss_fp32_keeps_fp32_reductions_and_gradients():
+    from market_jepa_v1_1.training import jepa_loss_fp32
+
+    generator = torch.Generator().manual_seed(20260907)
+    predictions = {
+        h: torch.randn(4, 16, generator=generator, dtype=torch.float16).requires_grad_()
+        for h in (16, 64, 256)
+    }
+    targets = {
+        h: torch.randn(4, 16, generator=generator, dtype=torch.float16)
+        for h in (16, 64, 256)
+    }
+    latent = torch.randn(4, 16, generator=generator, dtype=torch.float16, requires_grad=True)
+    loss, metrics = jepa_loss_fp32(
+        {"predictions": predictions, "targets": targets, "z_market": latent},
+        lambda_var=0.0, lambda_cov=0.0, variance_floor=1.0,
+    )
+    assert loss.dtype == torch.float32
+    assert all(value.dtype == torch.float32 for value in metrics.values())
+    loss.backward()
+    assert latent.grad is None  # formal lambda_var=lambda_cov=0: z_market enters loss through real predictors
+    for value in predictions.values():
+        assert value.grad is not None and torch.isfinite(value.grad).all()
+
+
+class _FakeV11Scaler:
+    def __init__(self, before: float, after: float):
+        self.scale = before
+        self.after = after
+        self.steps = 0
+
+    def get_scale(self):
+        return self.scale
+
+    def step(self, optimizer):
+        del optimizer
+        self.steps += 1
+
+    def update(self):
+        self.scale = self.after
+
+
+class _FakeV11Optimizer:
+    def __init__(self):
+        self.zero_grad_calls = 0
+
+    def zero_grad(self, *, set_to_none: bool):
+        assert set_to_none is True
+        self.zero_grad_calls += 1
+
+
+class _FakeV11Scheduler:
+    def __init__(self):
+        self.steps = 0
+
+    def step(self):
+        self.steps += 1
+
+
+class _FakeV11ModelForStep:
+    def __init__(self):
+        self.ema_updates = 0
+
+    def update_target(self, tau: float):
+        assert tau == 0.996
+        self.ema_updates += 1
+
+
+def _fake_v11_step_trainer(*, after_scale: float):
+    trainer = V11Trainer.__new__(V11Trainer)
+    trainer.scaler = _FakeV11Scaler(1024.0, after_scale)
+    trainer.optimizer = _FakeV11Optimizer()
+    trainer.scheduler = _FakeV11Scheduler()
+    trainer.model = _FakeV11ModelForStep()
+    trainer.config = {"training": {"ema_tau": 0.996}}
+    trainer.grad_scaler_enabled = True
+    trainer.global_step = 0
+    trainer.skipped_optimizer_steps = 0
+    trainer.consecutive_amp_overflows = 0
+    trainer.max_consecutive_amp_overflows = 8
+    return trainer
+
+
+def test_v11_float16_amp_overflow_skips_optimizer_dependent_state():
+    trainer = _fake_v11_step_trainer(after_scale=512.0)
+    assert trainer._finish_optimizer_step() is False
+    assert trainer.skipped_optimizer_steps == 1
+    assert trainer.consecutive_amp_overflows == 1
+    assert trainer.global_step == 0
+    assert trainer.scheduler.steps == 0
+    assert trainer.model.ema_updates == 0
+    assert trainer.optimizer.zero_grad_calls == 1
+
+
+def test_v11_float16_amp_success_advances_optimizer_dependent_state():
+    trainer = _fake_v11_step_trainer(after_scale=1024.0)
+    assert trainer._finish_optimizer_step() is True
+    assert trainer.skipped_optimizer_steps == 0
+    assert trainer.consecutive_amp_overflows == 0
+    assert trainer.global_step == 1
+    assert trainer.scheduler.steps == 1
+    assert trainer.model.ema_updates == 1
+
+
+def test_v11_repeated_float16_amp_overflow_hard_fails():
+    trainer = _fake_v11_step_trainer(after_scale=512.0)
+    trainer.consecutive_amp_overflows = 7
+    with pytest.raises(FloatingPointError, match="8 consecutive"):
+        trainer._finish_optimizer_step()
+    assert trainer.global_step == 0
+    assert trainer.scheduler.steps == 0
+    assert trainer.model.ema_updates == 0
+
+
+def test_v11_finite_gradient_norm_reduction_overflow_uses_fp64_fallback(monkeypatch):
+    parameter = torch.nn.Parameter(torch.zeros(4))
+    parameter.grad = torch.tensor([3.0, 4.0, 0.0, 0.0])
+
+    class Model:
+        def optimizer_parameters(self):
+            yield parameter
+
+    trainer = V11Trainer.__new__(V11Trainer)
+    trainer.model = Model()
+    trainer.config = {"training": {"gradient_clip_norm": 1.0}}
+    trainer.grad_scaler_enabled = False
+    trainer.amp_dtype_name = "bfloat16"
+
+    monkeypatch.setattr(
+        torch.nn.utils, "get_total_norm",
+        lambda *args, **kwargs: torch.tensor(float("inf")),
+    )
+    assert trainer._clip_gradients_or_skip() is True
+    torch.testing.assert_close(parameter.grad.norm(), torch.tensor(1.0), rtol=1e-5, atol=1e-6)
+
+
+def test_v11_nonfinite_gradient_is_hard_failure_without_grad_scaler():
+    parameter = torch.nn.Parameter(torch.zeros(2))
+    parameter.grad = torch.tensor([float("nan"), 1.0])
+
+    class Model:
+        def optimizer_parameters(self):
+            yield parameter
+
+    trainer = V11Trainer.__new__(V11Trainer)
+    trainer.model = Model()
+    trainer.config = {"training": {"gradient_clip_norm": 1.0}}
+    trainer.grad_scaler_enabled = False
+    trainer.amp_dtype_name = "bfloat16"
+    with pytest.raises(FloatingPointError, match="non-finite gradient elements"):
+        trainer._clip_gradients_or_skip()
+
+
+def test_v11_nonfinite_gradient_is_deferred_to_float16_grad_scaler():
+    parameter = torch.nn.Parameter(torch.zeros(2))
+    parameter.grad = torch.tensor([float("inf"), 1.0])
+
+    class Model:
+        def optimizer_parameters(self):
+            yield parameter
+
+    trainer = V11Trainer.__new__(V11Trainer)
+    trainer.model = Model()
+    trainer.config = {"training": {"gradient_clip_norm": 1.0}}
+    trainer.grad_scaler_enabled = True
+    trainer.amp_dtype_name = "float16"
+    assert trainer._clip_gradients_or_skip() is False

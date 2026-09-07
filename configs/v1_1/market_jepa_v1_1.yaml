@@ -56,6 +56,7 @@ training:
   gradient_clip_norm: 1.0
   ema_tau: 0.996
   amp: true
+  amp_dtype: bfloat16
   lambda_var: 0.0
   lambda_cov: 0.0
   variance_floor: 1.0

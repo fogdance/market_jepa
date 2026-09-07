@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from market_jepa.model.jepa import jepa_loss
 from market_jepa.train.checkpoint import save_checkpoint
 from market_jepa.train.trainer import capture_rng_state, restore_rng_state
 
@@ -42,6 +42,78 @@ def move(value: Any, device: torch.device):
 
 def model_inputs(batch: dict, device: torch.device) -> dict:
     return {key: move(batch[key], device) for key in MODEL_INPUT_KEYS}
+
+
+def jepa_loss_fp32(
+    output: dict[str, Any],
+    lambda_var: float = 0.0,
+    lambda_cov: float = 0.0,
+    variance_floor: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """V1.1 JEPA loss with numerically sensitive reductions forced to FP32.
+
+    The model may run under FP16/BF16 autocast, but cosine normalization and
+    latent variance/covariance reductions should not. Casting keeps gradients
+    connected to the original tensors while avoiding low-precision overflow.
+    """
+    predictions = {h: value.float() for h, value in output["predictions"].items()}
+    targets = {h: value.float() for h, value in output["targets"].items()}
+    horizon_losses = {
+        horizon: (1.0 - F.cosine_similarity(predictions[horizon], target, dim=-1)).mean()
+        for horizon, target in targets.items()
+    }
+    prediction = torch.stack(list(horizon_losses.values())).mean()
+
+    latent = output["z_market"].float()
+    std = torch.sqrt(latent.var(dim=0, unbiased=False) + 1e-4)
+    variance = torch.relu(float(variance_floor) - std).mean()
+    centered = latent - latent.mean(dim=0, keepdim=True)
+    covariance_matrix = centered.T @ centered / max(latent.shape[0] - 1, 1)
+    diagonal = torch.diagonal(covariance_matrix)
+    covariance = (covariance_matrix.square().sum() - diagonal.square().sum()) / latent.shape[1]
+
+    # Mathematically identical for zero coefficients, but avoids IEEE 0 * inf -> nan
+    # if a diagnostic term is extremely large while disabled in the formal objective.
+    total = prediction
+    if lambda_var:
+        total = total + float(lambda_var) * variance
+    if lambda_cov:
+        total = total + float(lambda_cov) * covariance
+
+    metrics = {f"prediction_loss_h{h}": value.detach() for h, value in horizon_losses.items()}
+    metrics.update(
+        prediction_loss=prediction.detach(),
+        variance_loss=variance.detach(),
+        covariance_loss=covariance.detach(),
+        total_loss=total.detach(),
+    )
+    return total, metrics
+
+
+def _amp_dtype(name: str) -> torch.dtype:
+    if name == "float16":
+        return torch.float16
+    if name == "bfloat16":
+        return torch.bfloat16
+    raise ValueError(f"unsupported V1.1 amp_dtype: {name}")
+
+
+def _gradient_elements_finite(parameters: list[torch.nn.Parameter]) -> bool:
+    return all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all().item()
+        for parameter in parameters
+    )
+
+
+def _stable_total_norm_fp64(parameters: list[torch.nn.Parameter]) -> torch.Tensor:
+    grads = [parameter.grad for parameter in parameters if parameter.grad is not None]
+    if not grads:
+        return torch.zeros((), dtype=torch.float64)
+    device = grads[0].device
+    total = torch.zeros((), dtype=torch.float64, device=device)
+    for grad in grads:
+        total = total + grad.detach().double().square().sum()
+    return total.sqrt()
 
 
 def assert_all_trainable_gradients(model) -> dict:
@@ -106,11 +178,19 @@ class V11Trainer:
             return 0.5 * (1 + math.cos(math.pi * min(max(progress, 0), 1)))
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, schedule)
         self.amp_enabled = bool(training["amp"] and device.type == "cuda")
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
-        self.amp_calibrated = not self.amp_enabled
+        self.amp_dtype_name = str(training.get("amp_dtype", "float16"))
+        self.amp_dtype = _amp_dtype(self.amp_dtype_name)
+        if self.amp_enabled and self.amp_dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("V1.1 amp_dtype=bfloat16 requested but CUDA device does not support BF16")
+        self.grad_scaler_enabled = self.amp_enabled and self.amp_dtype is torch.float16
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.grad_scaler_enabled)
+        self.amp_calibrated = not self.grad_scaler_enabled
         self.amp_calibration: list[dict[str, float | bool]] = []
         self.global_step = 0; self.start_epoch = 0; self.history: list[dict] = []
-        self.skipped_optimizer_steps = 0; self.gradient_connectivity: dict | None = None
+        self.skipped_optimizer_steps = 0
+        self.consecutive_amp_overflows = 0
+        self.max_consecutive_amp_overflows = 8
+        self.gradient_connectivity: dict | None = None
         self.daily_truncation_count = 0; self.daily_truncated_tokens = 0
         self.checkpoint_dir = Path(training["checkpoint_dir"])
         self.manifest = v11_implementation_manifest(); self.manifest_digest = manifest_sha256(self.manifest)
@@ -119,6 +199,8 @@ class V11Trainer:
         """Find a finite initial scale without consuming an optimizer/EMA step."""
         if self.amp_calibrated:
             return
+        if not self.grad_scaler_enabled:
+            raise RuntimeError("V1.1 AMP calibration is only valid for float16 GradScaler mode")
         rng = capture_rng_state(include_cuda=True)
         scale = 65536.0
         try:
@@ -128,11 +210,11 @@ class V11Trainer:
                 probe = torch.amp.GradScaler("cuda", init_scale=scale)
                 with torch.amp.autocast("cuda", dtype=torch.float16):
                     output = self.model(**kwargs)
-                    loss, _ = jepa_loss(
-                        output, lambda_var=self.config["training"]["lambda_var"],
-                        lambda_cov=self.config["training"]["lambda_cov"],
-                        variance_floor=self.config["training"]["variance_floor"],
-                    )
+                loss, _ = jepa_loss_fp32(
+                    output, lambda_var=self.config["training"]["lambda_var"],
+                    lambda_cov=self.config["training"]["lambda_cov"],
+                    variance_floor=self.config["training"]["variance_floor"],
+                )
                 if not torch.isfinite(loss):
                     raise FloatingPointError("V1.1 AMP calibration loss is nonfinite")
                 probe.scale(loss / self.accumulation).backward()
@@ -151,6 +233,67 @@ class V11Trainer:
         finally:
             self.optimizer.zero_grad(set_to_none=True)
             restore_rng_state(rng)
+
+    def _finish_optimizer_step(self) -> bool:
+        """Advance optimizer-dependent state only when the update is actually applied."""
+        scale_before = float(self.scaler.get_scale())
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        scale_after = float(self.scaler.get_scale())
+        step_succeeded = not self.grad_scaler_enabled or scale_after >= scale_before
+        self.optimizer.zero_grad(set_to_none=True)
+        if step_succeeded:
+            self.consecutive_amp_overflows = 0
+            self.scheduler.step()
+            self.model.update_target(self.config["training"]["ema_tau"])
+            self.global_step += 1
+        else:
+            self.skipped_optimizer_steps += 1
+            self.consecutive_amp_overflows += 1
+            if self.consecutive_amp_overflows >= self.max_consecutive_amp_overflows:
+                raise FloatingPointError(
+                    "V1.1 float16 AMP overflowed for "
+                    f"{self.consecutive_amp_overflows} consecutive optimizer attempts"
+                )
+        return step_succeeded
+
+    def _clip_gradients_or_skip(self) -> bool:
+        """Clip finite gradients; let GradScaler recover true FP16 overflow steps.
+
+        The common path uses PyTorch's fast norm reduction. Only if that norm is
+        non-finite do we scan gradient elements and, when all elements are finite,
+        recompute the norm in FP64 to distinguish reduction overflow from real NaN/Inf.
+        """
+        parameters = list(self.model.optimizer_parameters())
+        grads = [parameter.grad for parameter in parameters if parameter.grad is not None]
+        if not grads:
+            raise RuntimeError("V1.1 optimizer step has no gradients")
+        total_norm = torch.nn.utils.get_total_norm(
+            grads, norm_type=2.0, error_if_nonfinite=False,
+        )
+        if torch.isfinite(total_norm):
+            torch.nn.utils.clip_grads_with_norm_(
+                parameters, self.config["training"]["gradient_clip_norm"], total_norm,
+            )
+            return True
+
+        if _gradient_elements_finite(parameters):
+            stable_norm = _stable_total_norm_fp64(parameters)
+            if not torch.isfinite(stable_norm):
+                raise FloatingPointError("V1.1 FP64 gradient norm is non-finite")
+            torch.nn.utils.clip_grads_with_norm_(
+                parameters, self.config["training"]["gradient_clip_norm"], stable_norm,
+            )
+            return True
+
+        if self.grad_scaler_enabled:
+            # unscale_ has already recorded found_inf for GradScaler. Do not clip
+            # non-finite gradients; scaler.step() will skip the optimizer update and
+            # scaler.update() will lower the scale.
+            return False
+        raise FloatingPointError(
+            f"V1.1 non-finite gradient elements under amp_dtype={self.amp_dtype_name}"
+        )
 
     def _run_epoch(self, loader, training: bool) -> dict[str, float]:
         self.model.train(training)
@@ -171,11 +314,12 @@ class V11Trainer:
             kwargs = model_inputs(raw, self.device)
             if training:
                 self._calibrate_amp(kwargs)
-            with (torch.enable_grad() if training else torch.inference_mode()), torch.amp.autocast(
-                self.device.type, dtype=torch.float16, enabled=self.amp_enabled
-            ):
-                output = self.model(**kwargs)
-                loss, metrics = jepa_loss(
+            with (torch.enable_grad() if training else torch.inference_mode()):
+                with torch.amp.autocast(
+                    self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled
+                ):
+                    output = self.model(**kwargs)
+                loss, metrics = jepa_loss_fp32(
                     output, lambda_var=self.config["training"]["lambda_var"],
                     lambda_cov=self.config["training"]["lambda_cov"],
                     variance_floor=self.config["training"]["variance_floor"],
@@ -186,20 +330,14 @@ class V11Trainer:
                 self.scaler.scale(loss / self.accumulation).backward()
                 if (index + 1) % self.accumulation == 0 or index + 1 == len(loader):
                     self.scaler.unscale_(self.optimizer)
-                    if self.gradient_connectivity is None:
+                    gradients_finite = self._clip_gradients_or_skip()
+                    if gradients_finite and self.gradient_connectivity is None:
                         self.gradient_connectivity = assert_all_trainable_gradients(self.model)
-                    torch.nn.utils.clip_grad_norm_(
-                        list(self.model.optimizer_parameters()), self.config["training"]["gradient_clip_norm"],
-                        error_if_nonfinite=True,
-                    )
-                    before = self.scaler.get_scale()
-                    self.scaler.step(self.optimizer); self.scaler.update()
-                    if self.scaler.get_scale() < before:
-                        self.skipped_optimizer_steps += 1
-                    else:
-                        self.scheduler.step(); self.model.update_target(self.config["training"]["ema_tau"])
-                        self.global_step += 1
-                    self.optimizer.zero_grad(set_to_none=True)
+                    step_succeeded = self._finish_optimizer_step()
+                    if not gradients_finite and step_succeeded:
+                        raise FloatingPointError(
+                            "V1.1 GradScaler failed to skip an optimizer step with non-finite gradients"
+                        )
             size = kwargs["minute_market"].shape[0]
             total_loss += float(loss.detach()) * size; count += size
             for horizon in self.model.horizons:
@@ -235,6 +373,9 @@ class V11Trainer:
             "daily_truncation_count": self.daily_truncation_count,
             "daily_truncated_tokens": self.daily_truncated_tokens,
             "skipped_optimizer_steps": self.skipped_optimizer_steps,
+            "consecutive_amp_overflows": self.consecutive_amp_overflows,
+            "amp_dtype": self.amp_dtype_name,
+            "grad_scaler_enabled": self.grad_scaler_enabled,
             "amp_calibration": self.amp_calibration,
             "history": self.history, "gradient_connectivity": self.gradient_connectivity,
         }
@@ -309,6 +450,7 @@ class V11Trainer:
         self.sampler.load_state_dict(state["sampler"])
         self.global_step = int(state["global_step"]); self.start_epoch = int(state["epoch"]) + 1
         self.history = list(state["history"]); self.skipped_optimizer_steps = int(state.get("skipped_optimizer_steps", 0))
+        self.consecutive_amp_overflows = int(state.get("consecutive_amp_overflows", 0))
         self.daily_truncation_count = int(state["daily_truncation_count"])
         self.daily_truncated_tokens = int(state["daily_truncated_tokens"])
         self.gradient_connectivity = state.get("gradient_connectivity")

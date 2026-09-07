@@ -110,6 +110,7 @@ DEFAULT_V11_CONFIG: dict[str, Any] = {
     "training": {
         **deepcopy(DEFAULT_CONFIG["training"]), "num_workers": 8,
         "gradient_checkpointing": False,
+        "amp_dtype": "bfloat16",
     },
     "development": {
         "optimizer_steps": 100,
@@ -216,6 +217,9 @@ def validate_v11_config(config: dict[str, Any]) -> None:
     training = config["training"]
     if not isinstance(training.get("gradient_checkpointing", False), bool):
         raise ValueError("training.gradient_checkpointing must be boolean")
+    amp_dtype = training.get("amp_dtype", "float16")
+    if amp_dtype not in {"float16", "bfloat16"}:
+        raise ValueError("training.amp_dtype must be float16 or bfloat16")
     for name in ("optimizer", "learning_rate", "weight_decay", "betas", "eps", "ema_tau",
                  "lambda_var", "lambda_cov", "variance_floor", "gradient_clip_norm",
                  "scheduler", "warmup_ratio"):

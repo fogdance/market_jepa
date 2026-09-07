@@ -106,6 +106,7 @@ def validate_formal_training_config(config: dict[str, Any]) -> None:
         "gradient_clip_norm": 1.0,
         "ema_tau": 0.996,
         "amp": True,
+        "amp_dtype": "bfloat16",
         "num_workers": 8,
         "gradient_checkpointing": profile_training["gradient_checkpointing"],
     }
@@ -191,6 +192,7 @@ def run_formal_training(
     output.mkdir(parents=True, exist_ok=True)
     log_path = output / "training.log"
     config = _formal_config(config_path, output)
+    model_size = model_size_from_config(config["model"])
     checkpoint_path = Path(config["training"]["checkpoint_dir"]) / "last.pt"
     if resume is None and checkpoint_path.exists():
         raise FileExistsError(f"formal checkpoint already exists; use --resume {checkpoint_path}")
@@ -301,6 +303,8 @@ def run_formal_training(
         "samples_per_epoch": len(train_dataset),
         "batch_size": config["training"]["batch_size"],
         "gradient_accumulation": config["training"]["gradient_accumulation"],
+        "amp": config["training"]["amp"],
+        "amp_dtype": config["training"].get("amp_dtype", "float16"),
         "epochs": config["training"]["max_epochs"],
         "seed": config["training"]["seed"],
         "num_workers": config["training"]["num_workers"],
