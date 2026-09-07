@@ -228,6 +228,12 @@ def validate_v11_config(config: dict[str, Any]) -> None:
     if history["series_mode"] != "same_delivery_month":
         raise ValueError("V1.1 requires history_week.series_mode=same_delivery_month")
     training = config["training"]
+    if (
+        isinstance(training.get("max_epochs"), bool)
+        or not isinstance(training.get("max_epochs"), int)
+        or training["max_epochs"] <= 0
+    ):
+        raise ValueError("training.max_epochs must be a positive integer")
     if not isinstance(training.get("gradient_checkpointing", False), bool):
         raise ValueError("training.gradient_checkpointing must be boolean")
     amp_dtype = training.get("amp_dtype", "float16")

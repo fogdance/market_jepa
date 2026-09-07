@@ -957,6 +957,11 @@ def test_v11_formal_training_contract_is_frozen():
     changed = deepcopy(config); changed["training"]["batch_size"] = 32
     with pytest.raises(ValueError, match="training configuration mismatch"):
         validate_formal_training_config(changed)
+    changed = deepcopy(config); changed["training"]["max_epochs"] = 100
+    validate_formal_training_config(changed)
+    changed = deepcopy(config); changed["training"]["max_epochs"] = 0
+    with pytest.raises(ValueError, match="max_epochs must be a positive integer"):
+        validate_formal_training_config(changed)
 
 
 def test_v11_formal_entrypoint_is_checkpointed_implementation():

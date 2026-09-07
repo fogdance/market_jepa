@@ -50,7 +50,7 @@ training:
   eps: 1.0e-8
   batch_size: 64
   gradient_accumulation: 2
-  max_epochs: 50
+  max_epochs: 100
   warmup_ratio: 0.05
   scheduler: cosine
   gradient_clip_norm: 1.0

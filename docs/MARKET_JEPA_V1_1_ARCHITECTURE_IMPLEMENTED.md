@@ -10,7 +10,7 @@ The separate formal entrypoint is `train_market_jepa_v1_1.py`; the development
 entrypoint remains bounded smoke only. Formal training runs all Train-only data
 hard gates, loads every eligible FG/SA/JM/SH/SP episode, fits one deterministic
 shared scaler, rebuilds a new scaled dataset, and uses the hierarchical sampler
-for exactly 50 epochs. It writes only `last.pt` under
+for the epoch budget configured by `training.max_epochs`. It writes only `last.pt` under
 `artifacts/training/v1_1_formal/checkpoints`, supports strict `--resume`, and
 never constructs a validation loader or opens an RB bar file.
 

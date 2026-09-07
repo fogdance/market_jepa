@@ -71,7 +71,7 @@ def _git_state() -> tuple[str, bool]:
 
 def validate_formal_training_config(config: dict[str, Any]) -> None:
     validate_v11_config(config)
-    if Path(config["data"]["root"]).resolve() != FORMAL_DATA_ROOT:
+    if Path(config["data"]["root"]).resolve() != FORMAL_DATA_ROOT.resolve():
         raise ValueError(f"formal V1.1 data root must be {FORMAL_DATA_ROOT}")
     history = config["history_week"]
     if (
@@ -101,7 +101,6 @@ def validate_formal_training_config(config: dict[str, Any]) -> None:
         "weight_decay": 0.05,
         "batch_size": profile_training["batch_size"],
         "gradient_accumulation": profile_training["gradient_accumulation"],
-        "max_epochs": 50,
         "warmup_ratio": 0.05,
         "scheduler": "cosine",
         "gradient_clip_norm": 1.0,
@@ -265,6 +264,8 @@ def run_formal_training(
     log_path = output / "training.log"
     config = _formal_config(config_path, output)
     model_size = model_size_from_config(config["model"])
+    max_epochs = int(config["training"]["max_epochs"])
+    final_epoch = max_epochs - 1
     checkpoint_path = Path(config["training"]["checkpoint_dir"]) / "last.pt"
     if resume is None and checkpoint_path.exists():
         raise FileExistsError(f"formal checkpoint already exists; use --resume {checkpoint_path}")
@@ -386,7 +387,7 @@ def run_formal_training(
         "scaler_total_selected_anchors": sum(scaler_selection.values()),
         "scaler_source_valid_counts": shared_scaler.source_counts,
         "checkpoint_policy": "fixed_budget_final",
-        "official_endpoint": "epoch 49 last.pt",
+        "official_endpoint": f"epoch {final_epoch} last.pt",
         "HELD_OUT_READ_DURING_TRAINING": False,
         "RB_READ_DURING_TRAINING": False if held_out_commodity == "RB" else None,
         "wandb": {
@@ -402,7 +403,7 @@ def run_formal_training(
     checkpoint_policy = {
         "selection": "fixed_budget_final",
         "official_checkpoint": str(checkpoint_path),
-        "official_epoch": 49,
+        "official_epoch": final_epoch,
         "validation_dataset": False,
         "validation_can_select_checkpoint": False,
         "early_stopping": False,
@@ -486,8 +487,8 @@ def run_formal_training(
         and not state["gradient_connectivity"]["nonfinite"]
     )
     completed = (
-        len(history) == 50 and history[-1]["epoch"] == 49
-        and int(state["epoch"]) == 49 and finite_metrics and gradient_ok
+        len(history) == max_epochs and history[-1]["epoch"] == final_epoch
+        and int(state["epoch"]) == final_epoch and finite_metrics and gradient_ok
         and state["checkpoint_selection"] == "fixed_budget_final"
         and state["data_manifest_sha256"] == data_manifest_sha256
         and state["v11_implementation_sha256"] == implementation_sha256
@@ -509,8 +510,9 @@ def run_formal_training(
     }
     write_json(output / "resource_usage.json", resource_usage)
     answers = [
-        f"All 50 epochs complete: {'YES' if len(history) == 50 else 'NO'}.",
-        f"Final checkpoint is epoch49 last.pt: {'YES' if state['epoch'] == 49 else 'NO'}.",
+        f"All {max_epochs} epochs complete: {'YES' if len(history) == max_epochs else 'NO'}.",
+        f"Final checkpoint is epoch{final_epoch} last.pt: "
+        f"{'YES' if state['epoch'] == final_epoch else 'NO'}.",
         f"Resume occurred: {'YES' if resumed else 'NO'}.",
         f"Final global_step: {state['global_step']}.",
         f"Train commodities: {list(train_commodities)}.",

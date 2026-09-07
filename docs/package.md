@@ -26,7 +26,7 @@
 
 如果训练曾 resume，不要只提供最后一段日志。
 
-需要提供从正式 epoch 0 开始到 epoch 49 结束的完整日志。
+需要提供从正式 epoch 0 开始到配置的 `training.max_epochs - 1` 结束的完整日志。
 
 ---
 
@@ -402,4 +402,3 @@ market_jepa_v0_training_review.tar.bz2.sha256
 * 开始 V1
 
 完成打包后停止。
-
