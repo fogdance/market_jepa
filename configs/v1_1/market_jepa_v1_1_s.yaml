@@ -1,0 +1,14 @@
+extends: market_jepa_v1_1.yaml
+experiment_id: market_jepa_v1_1_s
+model_size: S
+model:
+  d_model: 256
+  num_heads: 8
+  ffn_dim: 1024
+  minute_layers: 4
+  belief_dim: 256
+  predictor_hidden: 512
+training:
+  batch_size: 64
+  gradient_accumulation: 2
+  gradient_checkpointing: false

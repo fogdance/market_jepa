@@ -35,8 +35,35 @@ WEEKLY_CONTEXT_FEATURES = (
     "bar_is_partial", "elapsed_trading_days_fraction",
 )
 
+MODEL_SIZE_PROFILES: dict[str, dict[str, int]] = {
+    "S": {
+        "d_model": 256, "num_heads": 8, "ffn_dim": 1024,
+        "minute_layers": 4, "belief_dim": 256, "predictor_hidden": 512,
+    },
+    "M": {
+        "d_model": 384, "num_heads": 6, "ffn_dim": 1536,
+        "minute_layers": 6, "belief_dim": 384, "predictor_hidden": 768,
+    },
+    "L": {
+        "d_model": 512, "num_heads": 8, "ffn_dim": 2048,
+        "minute_layers": 8, "belief_dim": 512, "predictor_hidden": 1024,
+    },
+    "XL": {
+        "d_model": 768, "num_heads": 12, "ffn_dim": 3072,
+        "minute_layers": 8, "belief_dim": 768, "predictor_hidden": 1536,
+    },
+}
+
+PROFILE_TRAINING: dict[str, dict[str, int | bool]] = {
+    "S": {"batch_size": 64, "gradient_accumulation": 2, "gradient_checkpointing": False},
+    "M": {"batch_size": 64, "gradient_accumulation": 2, "gradient_checkpointing": False},
+    "L": {"batch_size": 64, "gradient_accumulation": 2, "gradient_checkpointing": True},
+    "XL": {"batch_size": 64, "gradient_accumulation": 2, "gradient_checkpointing": True},
+}
+
 DEFAULT_V11_CONFIG: dict[str, Any] = {
     "design_version": "1.1",
+    "model_size": "S",
     "experiment_id": "market_jepa_v1_1_development",
     "data": {
         "root": "/data/jepa/v1_1_raw",
@@ -80,7 +107,10 @@ DEFAULT_V11_CONFIG: dict[str, Any] = {
         "dropout": 0.1,
         "commodity_embedding": False,
     },
-    "training": {**deepcopy(DEFAULT_CONFIG["training"]), "num_workers": 8},
+    "training": {
+        **deepcopy(DEFAULT_CONFIG["training"]), "num_workers": 8,
+        "gradient_checkpointing": False,
+    },
     "development": {
         "optimizer_steps": 100,
         "batch_size": 2,
@@ -88,6 +118,16 @@ DEFAULT_V11_CONFIG: dict[str, Any] = {
         "anchors_per_contract": 16,
     },
 }
+
+
+def model_size_from_config(config: dict[str, Any]) -> str:
+    matches = [
+        size for size, values in MODEL_SIZE_PROFILES.items()
+        if all(config.get(name) == value for name, value in values.items())
+    ]
+    if len(matches) != 1:
+        raise ValueError("V1.1 model dimensions do not match a registered S/M/L/XL profile")
+    return matches[0]
 
 
 def validate_model_config(config: dict[str, Any], *, debug: bool = False) -> None:
@@ -108,15 +148,21 @@ def validate_model_config(config: dict[str, Any], *, debug: bool = False) -> Non
     if config["d_model"] % config["num_heads"] or config["d_model"] % 2:
         raise ValueError("d_model must be even and divisible by num_heads")
     if not debug:
+        size = model_size_from_config(config)
+        scalable = set(MODEL_SIZE_PROFILES[size])
         for name, value in expected.items():
-            if config[name] != value:
-                raise ValueError(f"formal V1.1 freezes {name}={value}")
+            if name not in scalable and config[name] != value:
+                raise ValueError(f"formal V1.1 freezes non-capacity field {name}={value}")
 
 
 def validate_v11_config(config: dict[str, Any]) -> None:
     if config.get("design_version") != "1.1":
         raise ValueError('V1.1 requires design_version="1.1"')
     validate_model_config(config["model"], debug=config.get("profile") == "debug")
+    if config.get("profile") != "debug":
+        inferred_size = model_size_from_config(config["model"])
+        if config.get("model_size", "S") != inferred_size:
+            raise ValueError(f"model_size must be {inferred_size} for configured dimensions")
     data = config["data"]
     train_commodities = data.get("train_commodities")
     if (
@@ -168,6 +214,8 @@ def validate_v11_config(config: dict[str, Any]) -> None:
     if history["series_mode"] != "same_delivery_month":
         raise ValueError("V1.1 requires history_week.series_mode=same_delivery_month")
     training = config["training"]
+    if not isinstance(training.get("gradient_checkpointing", False), bool):
+        raise ValueError("training.gradient_checkpointing must be boolean")
     for name in ("optimizer", "learning_rate", "weight_decay", "betas", "eps", "ema_tau",
                  "lambda_var", "lambda_cov", "variance_floor", "gradient_clip_norm",
                  "scheduler", "warmup_ratio"):
@@ -180,9 +228,35 @@ def validate_v11_config(config: dict[str, Any]) -> None:
         raise ValueError("development batch_size must be 2 or 8")
 
 
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = deepcopy(base)
+    for name, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(name), dict):
+            result[name] = _deep_merge(result[name], value)
+        else:
+            result[name] = deepcopy(value)
+    return result
+
+
+def _load_config_tree(path: Path, seen: set[Path]) -> dict[str, Any]:
+    resolved = path.resolve()
+    if resolved in seen:
+        raise ValueError(f"cyclic V1.1 config extends: {resolved}")
+    with resolved.open(encoding="utf-8") as handle:
+        value = yaml.safe_load(handle)
+    if not isinstance(value, dict):
+        raise ValueError("V1.1 configuration root must be a mapping")
+    parent = value.pop("extends", None)
+    if parent is None:
+        return value
+    if not isinstance(parent, str) or not parent:
+        raise ValueError("V1.1 config extends must be a nonempty relative path")
+    parent_path = (resolved.parent / parent).resolve()
+    return _deep_merge(_load_config_tree(parent_path, {*seen, resolved}), value)
+
+
 def load_v11_config(path: str | Path) -> dict[str, Any]:
-    with Path(path).open(encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
+    config = _load_config_tree(Path(path), set())
     if not isinstance(config, dict):
         raise ValueError("V1.1 configuration root must be a mapping")
     validate_v11_config(config)

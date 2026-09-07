@@ -922,8 +922,26 @@ def test_v11_fixed_budget_checkpoint_only(trained_v11_checkpoint):
     assert state["history"][0]["optimizer_steps_this_epoch"] == 1
     assert state["daily_truncation_count"] == 2
     assert state["daily_truncated_tokens"] == 6
+    assert state["model_size"] == "DEBUG"
+    assert state["d_model"] == 16
+    assert state["num_heads"] == 4
+    assert state["ffn_dim"] == 32
+    assert state["minute_layers"] == 1
+    assert state["predictor_hidden_dim"] == 32
+    assert state["trainable_parameter_count"] == sum(
+        parameter.numel() for parameter in trainer.model.parameters() if parameter.requires_grad
+    )
     tampered = deepcopy(state); tampered["checkpoint_selection"] = "validation_h64"
     with pytest.raises(ValueError, match="fixed_budget_final"):
+        validate_v11_checkpoint(tampered)
+    tampered = deepcopy(state); tampered["model_size"] = "XL"
+    with pytest.raises(ValueError, match="model_size mismatch"):
+        validate_v11_checkpoint(tampered)
+    tampered = deepcopy(state); tampered["trainable_parameter_count"] += 1
+    with pytest.raises(ValueError, match="parameter count mismatch"):
+        model_from_checkpoint(tampered)
+    tampered = deepcopy(state); del tampered["trainable_parameter_count"]
+    with pytest.raises(ValueError, match="incomplete.*capacity"):
         validate_v11_checkpoint(tampered)
 
 

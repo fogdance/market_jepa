@@ -248,7 +248,7 @@ def main() -> None:
     report = {
         "status": "PASS" if candidates else "FAIL",
         "purpose": "bounded throughput calibration; no formal epoch/checkpoint",
-        "model_scale": "V1.1-S",
+        "model_scale": f"V1.1-{config.get('model_size', 'S')}",
         "train_commodities": list(train_commodities),
         "held_out_commodity": config["data"]["held_out_commodity"],
         "held_out_read": False,

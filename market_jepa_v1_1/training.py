@@ -72,6 +72,7 @@ class V11Trainer:
         if model.architecture_config != config["model"]:
             raise ValueError("V1.1 model/config mismatch")
         self.model, self.config, self.device = model.to(device), deepcopy(config), device
+        self.model.set_gradient_checkpointing(bool(config["training"].get("gradient_checkpointing", False)))
         self.train_dataset, self.validation_dataset = train_dataset, validation_dataset
         self.data_manifest_sha256 = str(data_manifest_sha256)
         training = config["training"]
@@ -211,6 +212,15 @@ class V11Trainer:
             raise RuntimeError("V1.1 implementation changed during training")
         return {
             "design_version": "1.1", "v11_config": deepcopy(self.config),
+            "model_size": self.model.model_size,
+            "d_model": int(self.model.architecture_config["d_model"]),
+            "num_heads": int(self.model.architecture_config["num_heads"]),
+            "ffn_dim": int(self.model.architecture_config["ffn_dim"]),
+            "minute_layers": int(self.model.architecture_config["minute_layers"]),
+            "predictor_hidden_dim": int(self.model.architecture_config["predictor_hidden"]),
+            "trainable_parameter_count": sum(
+                parameter.numel() for parameter in self.model.parameters() if parameter.requires_grad
+            ),
             "architecture_config": deepcopy(self.model.architecture_config),
             "model": self.model.state_dict(), "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(), "scaler": self.scaler.state_dict(),
@@ -280,6 +290,13 @@ class V11Trainer:
 
     def resume(self, state: dict) -> None:
         validate_v11_checkpoint(state)
+        legacy_size = "DEBUG" if state["v11_config"].get("profile") == "debug" else self.model.model_size
+        state_size = state.get("model_size", legacy_size)
+        if state_size != self.model.model_size:
+            raise ValueError(f"cannot resume {self.model.model_size} from {state_size} checkpoint")
+        actual_trainable = sum(parameter.numel() for parameter in self.model.parameters() if parameter.requires_grad)
+        if state.get("trainable_parameter_count", actual_trainable) != actual_trainable:
+            raise ValueError("cannot resume V1.1 with changed trainable parameter count")
         if state["v11_config"] != self.config or state["data_manifest_sha256"] != self.data_manifest_sha256:
             raise ValueError("cannot resume V1.1 with changed config/data")
         if state["v11_implementation_sha256"] != self.manifest_digest:

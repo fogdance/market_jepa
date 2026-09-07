@@ -7,7 +7,7 @@ from torch import nn
 
 from market_jepa.model.jepa import Predictor
 
-from .config import validate_model_config
+from .config import model_size_from_config, validate_model_config
 from .encoders import (
     BeliefEncoder, CommodityMemoryEncoder, ContractLifecycleEncoder,
     MinuteHigherScaleConditioner, MinuteLocalEncoder,
@@ -23,6 +23,7 @@ class MarketJEPAV11(nn.Module):
         if tuple(horizons) != (16, 64, 256):
             raise ValueError("V1.1 predictors require H16/H64/H256")
         self.architecture_config = deepcopy(config)
+        self.model_size = model_size_from_config(config) if not debug else "DEBUG"
         self.horizons = tuple(horizons)
         self.commodity_memory = CommodityMemoryEncoder(config)
         self.contract_lifecycle = ContractLifecycleEncoder(config)
@@ -35,6 +36,11 @@ class MarketJEPAV11(nn.Module):
             for horizon in self.horizons
         })
         self.assert_no_identity_parameters()
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        """Checkpoint only the online minute stack; the EMA target stays no-grad."""
+        self.minute_local.market_core.set_gradient_checkpointing(enabled)
+        self.target_minute.set_gradient_checkpointing(False)
 
     def assert_no_identity_parameters(self) -> None:
         forbidden = ("commodity_embedding", "symbol_embedding", "symbol_id", "instrument_embedding")

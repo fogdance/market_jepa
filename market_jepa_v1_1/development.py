@@ -67,7 +67,7 @@ def parameter_counts(config: dict) -> dict:
         },
     }
     result["v1_1_to_v0_ratio"] = result["v1_1_trainable"] / result["v0_trainable"]
-    if result["v1_1_trainable"] > 3 * result["v0_trainable"]:
+    if config.get("model_size", "S") == "S" and result["v1_1_trainable"] > 3 * result["v0_trainable"]:
         raise RuntimeError("STOP: V1.1 trainable parameter count exceeds 3x V0")
     return result
 

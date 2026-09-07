@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 class SinusoidalPosition(nn.Module):
@@ -137,6 +138,12 @@ class MinuteMarketCore(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(layer, config["minute_layers"], enable_nested_tensor=False)
         self.output_norm = nn.LayerNorm(dim)
+        self.gradient_checkpointing = False
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        if not isinstance(enabled, bool):
+            raise TypeError("gradient checkpointing flag must be boolean")
+        self.gradient_checkpointing = enabled
 
     def encode_tokens(
         self, market: torch.Tensor, validity: torch.Tensor, mask: torch.Tensor,
@@ -156,7 +163,14 @@ class MinuteMarketCore(nn.Module):
         positions = ((~full_mask).long().cumsum(dim=1) - 1).clamp_min(0)
         tokens = tokens + self.source_embedding + self.position.encoding[0, positions].to(tokens.dtype)
         tokens = tokens.masked_fill(full_mask.unsqueeze(-1), 0)
-        encoded = self.output_norm(self.transformer(tokens, src_key_padding_mask=full_mask))
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            encoded = checkpoint(
+                lambda value: self.transformer(value, src_key_padding_mask=full_mask),
+                tokens, use_reentrant=False, preserve_rng_state=True,
+            )
+        else:
+            encoded = self.transformer(tokens, src_key_padding_mask=full_mask)
+        encoded = self.output_norm(encoded)
         return encoded.masked_fill(full_mask.unsqueeze(-1), 0), full_mask
 
     def forward(self, market: torch.Tensor, validity: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

@@ -20,7 +20,7 @@ from market_jepa.train.trainer import configure_determinism
 from .checkpoint import (
     load_v11_checkpoint, model_from_checkpoint, v11_implementation_manifest,
 )
-from .config import load_v11_config, validate_v11_config
+from .config import PROFILE_TRAINING, load_v11_config, model_size_from_config, validate_v11_config
 from .dataset import V11ContractDataset, V11DataStore, fit_v11_shared_scaler
 from .development import (
     audit_contract_lineages, audit_full_production_bars,
@@ -91,13 +91,15 @@ def validate_formal_training_config(config: dict[str, Any]) -> None:
     }
     if mismatched_history:
         raise ValueError(f"formal V1.1 frozen commodity history mismatch: {mismatched_history}")
+    model_size = model_size_from_config(config["model"])
+    profile_training = PROFILE_TRAINING[model_size]
     expected_training = {
         "seed": 42,
         "optimizer": "AdamW",
         "learning_rate": 3e-4,
         "weight_decay": 0.05,
-        "batch_size": 64,
-        "gradient_accumulation": 2,
+        "batch_size": profile_training["batch_size"],
+        "gradient_accumulation": profile_training["gradient_accumulation"],
         "max_epochs": 50,
         "warmup_ratio": 0.05,
         "scheduler": "cosine",
@@ -105,6 +107,7 @@ def validate_formal_training_config(config: dict[str, Any]) -> None:
         "ema_tau": 0.996,
         "amp": True,
         "num_workers": 8,
+        "gradient_checkpointing": profile_training["gradient_checkpointing"],
     }
     mismatches = {
         name: {"expected": expected, "actual": config["training"].get(name)}
@@ -275,7 +278,7 @@ def run_formal_training(
     write_json(output / "parameter_counts.json", counts)
     protocol = {
         "design_version": "1.1",
-        "model_scale": "V1.1-S",
+        "model_scale": f"V1.1-{model_size}",
         "git_commit": git_commit,
         "git_tracked_worktree_dirty_at_start": git_dirty,
         "config_sha256": config_sha256,
