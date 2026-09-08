@@ -53,7 +53,10 @@ def completed_run_gate(checkpoint, state):
     run = Path(checkpoint).resolve().parent.parent
     summary_path = run / "final_summary.json"
     summary = json.loads(summary_path.read_text())
-    if summary.get("status") not in {"V1_1_FORMAL_TRAINING_PASS", "V1_1_CONTROL_TRAINING_PASS"}:
+    if summary.get("status") not in {
+        "V1_1_FORMAL_TRAINING_PASS", "V1_1_CONTROL_TRAINING_PASS",
+        "V1_1_FIXED_SAMPLE_BUDGET_TRAINING_PASS",
+    }:
         raise ValueError("training completion/hard-gate summary is not PASS")
     if summary.get("checkpoint_sha256") != file_hash(checkpoint):
         raise ValueError("training summary checkpoint checksum mismatch")
@@ -202,7 +205,12 @@ def validate_manifest(manifest):
 def final_checkpoint_gate(state, manifest):
     validate_manifest(manifest)
     config = state["v11_config"]
-    if state["epoch"] != config["training"]["max_epochs"] - 1:
+    fixed = state.get("training_protocol_version") == "fixed_sample_budget_v1"
+    if fixed:
+        if (state["global_step"] != state["max_optimizer_steps"] or
+                state["samples_seen"] != state["target_samples_seen"]):
+            raise ValueError("CHECKPOINT_NOT_FINAL")
+    elif state["epoch"] != config["training"]["max_epochs"] - 1:
         raise ValueError("CHECKPOINT_NOT_FINAL")
     if state["checkpoint_selection"] != "fixed_budget_final":
         raise ValueError("checkpoint policy mismatch")
@@ -213,14 +221,22 @@ def final_checkpoint_gate(state, manifest):
         raise ValueError("training population mismatch or RB contamination")
     if set(state["shared_imc_scaler"]["fitted_commodities"]) != train:
         raise ValueError("scaler training population mismatch")
-    if len(state.get("history", [])) != config["training"]["max_epochs"]:
-        raise ValueError("incomplete fixed training budget")
-    if [r["epoch"] for r in state["history"]] != list(range(config["training"]["max_epochs"])):
-        raise ValueError("checkpoint epoch history is not contiguous")
+    if fixed:
+        history = state.get("interval_history", [])
+        if not history or history[0]["step_start"] != 1 or history[-1]["step_end"] != state["max_optimizer_steps"]:
+            raise ValueError("incomplete fixed optimizer-step budget")
+        if any(left["step_end"] + 1 != right["step_start"] for left, right in zip(history, history[1:])):
+            raise ValueError("checkpoint interval history is not contiguous")
+    else:
+        history = state.get("history", [])
+        if len(history) != config["training"]["max_epochs"]:
+            raise ValueError("incomplete legacy epoch budget")
+        if [r["epoch"] for r in history] != list(range(config["training"]["max_epochs"])):
+            raise ValueError("checkpoint epoch history is not contiguous")
     connectivity = state.get("gradient_connectivity")
     if not connectivity or connectivity.get("missing") or connectivity.get("nonfinite"):
         raise ValueError("checkpoint gradient connectivity gate failed")
-    for record in state["history"]:
+    for record in history:
         for key in ("train_loss", "prediction_loss_h16", "prediction_loss_h64", "prediction_loss_h256"):
             if key not in record or not np.isfinite(record[key]):
                 raise ValueError("checkpoint training metrics missing/nonfinite")
@@ -241,9 +257,9 @@ def semantic_implementation_gate(state):
         if (not protocol or provenance.get("control_protocol_sha256") != digest(protocol)
                 or protocol.get("variant") != state["evaluation_variant"]
                 or protocol.get("from_scratch") is not True
-                or provenance.get("reference_sampler_num_samples") != state["sampler"]["num_samples"]
                 or any(provenance.get(k) != protocol.get(k) for k in
-                       ("reference_checkpoint_sha256", "reference_sampler_num_samples"))):
+                       ("reference_checkpoint_sha256", "reference_sampling_population_sha256",
+                        "reference_max_optimizer_steps", "reference_effective_batch_size"))):
             raise ValueError("control provenance mismatch")
 
 
@@ -257,6 +273,31 @@ def matched_control_gate(control, reference):
     provenance = control.get("control_provenance", {})
     if (not provenance.get("control_protocol_sha256")
             or provenance.get("reference_checkpoint_sha256") != reference["checkpoint_sha256"]
-            or provenance.get("reference_sampler_num_samples") != reference["sampler_num_samples"]
-            or control["sampler_num_samples"] != reference["sampler_num_samples"]):
+            or provenance.get("reference_sampling_population_sha256") != reference["training_budget"]["sampling_population_sha256"]
+            or provenance.get("reference_max_optimizer_steps") != reference["training_budget"]["max_optimizer_steps"]
+            or provenance.get("reference_effective_batch_size") != reference["training_budget"]["effective_batch_size"]
+            or control["training_budget"] != reference["training_budget"]):
         raise ValueError("matched control reference checkpoint/sampler mismatch")
+
+
+def training_budget_provenance(state):
+    if state.get("training_protocol_version") == "fixed_sample_budget_v1":
+        return {
+            "protocol_version": state["training_protocol_version"],
+            "budget_mode": state["budget_mode"],
+            "max_optimizer_steps": state["max_optimizer_steps"],
+            "effective_batch_size": state["effective_batch_size"],
+            "target_samples_seen": state["target_samples_seen"],
+            "warmup_optimizer_steps": state["warmup_optimizer_steps"],
+            "checkpoint_every_optimizer_steps": state["checkpoint_every_optimizer_steps"],
+            "sampling_population_sha256": state["sampling_population_sha256"],
+            "sampler_seed": state["v11_config"]["training"]["seed"],
+        }
+    training = state["v11_config"]["training"]
+    return {
+        "protocol_version": "legacy_epoch_budget",
+        "budget_mode": "epochs",
+        "max_epochs": training["max_epochs"],
+        "effective_batch_size": training["batch_size"] * training["gradient_accumulation"],
+        "warmup_ratio": training["warmup_ratio"],
+    }

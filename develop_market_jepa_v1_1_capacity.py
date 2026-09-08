@@ -81,11 +81,11 @@ def checkpoint_roundtrips(configs: dict[str, dict], legacy_path: Path) -> dict:
                 config["data"]["train_commodities"], config["data"]["held_out_commodity"],
             )
             trainer = V11Trainer(
-                model, config, dataset, torch.device("cpu"), samples_per_epoch=len(dataset),
+                model, config, dataset, torch.device("cpu"),
                 data_manifest_sha256="capacity-checkpoint-roundtrip",
             )
             path = root / f"{size}.pt"
-            save_checkpoint(trainer._state(0), path)
+            save_checkpoint(trainer._state(), path)
             del model, trainer
             gc.collect()
             state = load_v11_checkpoint(path)

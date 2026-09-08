@@ -9,7 +9,7 @@ import pytest
 
 from market_jepa_v1_1.config import DEFAULT_V11_CONFIG, validate_v11_config
 from market_jepa_v1_1.formal_training import (
-    _wandb_run_name, _wandb_tags, run_formal_training,
+    FixedBudgetMetricLogger, _wandb_run_name, _wandb_tags, run_formal_training,
 )
 from market_jepa_v1_1.wandb_logging import V11WandbLogger, read_persisted_run_id
 
@@ -189,7 +189,7 @@ def test_wandb_run_id_persisted(tmp_path):
     assert value == {
         "run_id": "run-123",
         "project": "market-jepa",
-        "group": "v1.1-formal",
+        "group": "v1.1-formal-fixed-budget-v1",
         "run_name": "test-run",
         "url": "https://wandb.invalid/run-123",
     }
@@ -242,7 +242,76 @@ def test_wandb_config_modes_and_unsupported_uploads():
 
 def test_wandb_default_formal_name_and_tags():
     config = deepcopy(DEFAULT_V11_CONFIG)
-    assert _wandb_run_name(config, 8_262_661) == "v1.1-S-8.26M-50E-seed42"
+    assert _wandb_run_name(config, 8_262_661) == "v1.1-S-8.26M-250Kstep-seed42"
     assert _wandb_tags(config, 8_262_661) == ["formal", "v1.1", "S", "8M", "BF16"]
     config["logging"]["wandb"]["run_name"] = "manual-name"
     assert _wandb_run_name(config, 8_262_661) == "manual-name"
+
+
+class _MirrorLogger:
+    def __init__(self) -> None:
+        self.payloads = []
+
+    def log_metrics(self, payload):
+        self.payloads.append(dict(payload))
+
+
+def test_fixed_budget_metric_logger_local_first_and_exact_mirror(tmp_path):
+    mirror = _MirrorLogger()
+    logger = FixedBudgetMetricLogger(tmp_path, mirror, interval=2)
+    common = dict(
+        skipped_optimizer_steps=0, allocated_vram_bytes=None, reserved_vram_bytes=None,
+    )
+    logger.log_step(
+        global_step=1, samples_seen=8, loss=1.0, h16_loss=2.0, h64_loss=3.0,
+        h256_loss=4.0, learning_rate=1e-4, grad_norm=2.0, step_seconds=2.0,
+        samples=8, **common,
+    )
+    assert not (tmp_path / "step_metrics.jsonl").exists()
+    assert mirror.payloads == []
+    logger.log_step(
+        global_step=2, samples_seen=16, loss=3.0, h16_loss=4.0, h64_loss=5.0,
+        h256_loss=6.0, learning_rate=2e-4, grad_norm=4.0, step_seconds=2.0,
+        samples=8, **common,
+    )
+    records = [json.loads(line) for line in (tmp_path / "step_metrics.jsonl").read_text().splitlines()]
+    assert records == [{
+        "global_step": 2, "samples_seen": 16, "loss": 2.0, "h16_loss": 3.0,
+        "h64_loss": 4.0, "h256_loss": 5.0, "learning_rate": 2e-4,
+        "grad_norm": 3.0, "skipped_optimizer_steps": 0, "step_seconds": 2.0,
+        "samples_per_sec": 4.0, "allocated_vram": None, "reserved_vram": None,
+    }]
+    assert mirror.payloads == [{
+        "global_step": 2, "samples_seen": 16, "train/loss": 2.0,
+        "train/h16_loss": 3.0, "train/h64_loss": 4.0, "train/h256_loss": 5.0,
+        "optim/learning_rate": 2e-4, "optim/skipped_optimizer_steps": 0,
+        "perf/step_seconds": 2.0, "perf/samples_per_sec": 4.0,
+        "optim/grad_norm": 3.0,
+    }]
+
+
+def test_fixed_budget_metric_logger_resume_buffer_and_reconcile(tmp_path):
+    mirror = _MirrorLogger()
+    logger = FixedBudgetMetricLogger(tmp_path, mirror, interval=2)
+    logger.log_step(
+        global_step=1, samples_seen=8, loss=1.0, h16_loss=1.0, h64_loss=1.0,
+        h256_loss=1.0, learning_rate=1e-4, grad_norm=1.0,
+        skipped_optimizer_steps=0, step_seconds=1.0, samples=8,
+        allocated_vram_bytes=None, reserved_vram_bytes=None,
+    )
+    state = logger.state_dict()
+    resumed = FixedBudgetMetricLogger(tmp_path, mirror, interval=2)
+    resumed.load_state_dict(state)
+    resumed.log_step(
+        global_step=2, samples_seen=16, loss=3.0, h16_loss=3.0, h64_loss=3.0,
+        h256_loss=3.0, learning_rate=2e-4, grad_norm=3.0,
+        skipped_optimizer_steps=0, step_seconds=1.0, samples=8,
+        allocated_vram_bytes=None, reserved_vram_bytes=None,
+    )
+    path = tmp_path / "step_metrics.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"global_step": 999, "samples_seen": 999}) + "\n")
+    resumed.reconcile(2)
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    assert [record["global_step"] for record in records] == [2]
+    assert records[0]["loss"] == pytest.approx(2.0)

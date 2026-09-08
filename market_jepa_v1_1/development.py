@@ -475,13 +475,17 @@ def production_smoke(
     value = deepcopy(config)
     value["training"].update(
         batch_size=config["development"]["batch_size"], gradient_accumulation=1,
-        max_epochs=1, num_workers=0, checkpoint_dir=str(output / "checkpoints"),
+        max_optimizer_steps=int(value["development"]["optimizer_steps"]),
+        warmup_optimizer_steps=1,
+        checkpoint_every_optimizer_steps=int(value["development"]["optimizer_steps"]),
+        progress_every_optimizer_steps=int(value["development"]["optimizer_steps"]),
+        num_workers=0, checkpoint_dir=str(output / "checkpoints"),
     )
     configure_determinism(value["training"]["seed"])
     model = MarketJEPAV11(value["model"])
     steps = int(value["development"]["optimizer_steps"])
     trainer = V11Trainer(
-        model, value, train_dataset, device, samples_per_epoch=steps * value["training"]["batch_size"],
+        model, value, train_dataset, device,
         data_manifest_sha256=sha256(root / "build_manifest.json"),
     )
     if device.type == "cuda":
@@ -494,7 +498,6 @@ def production_smoke(
     restored_model = model_from_checkpoint(state).to(device).eval()
     restored_trainer = V11Trainer(
         restored_model, value, train_dataset, device,
-        samples_per_epoch=steps * value["training"]["batch_size"],
         data_manifest_sha256=state["data_manifest_sha256"],
     )
     restored_trainer.resume(state)

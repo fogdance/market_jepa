@@ -153,14 +153,22 @@ def test_control_trainer_checkpoint_resume(tmp_path, variant):
     config = _trainer_config(tmp_path)
     ds = _TrainerDataset()
     model = control_model(config["model"], variant, debug=True)
-    protocol = {"variant": variant, "reference_checkpoint_sha256": "reference", "reference_sampler_num_samples": 2, "from_scratch": True}
-    trainer = ControlTrainer(model, config, ds, torch.device("cpu"), control_protocol=protocol, samples_per_epoch=2, data_manifest_sha256="fixture")
+    from market_jepa_v1_1.sampler import sampling_population_sha256
+    protocol = {
+        "variant": variant,
+        "reference_checkpoint_sha256": "reference",
+        "reference_sampling_population_sha256": sampling_population_sha256(ds, "fixture"),
+        "reference_max_optimizer_steps": 1,
+        "reference_effective_batch_size": 2,
+        "from_scratch": True,
+    }
+    trainer = ControlTrainer(model, config, ds, torch.device("cpu"), control_protocol=protocol, data_manifest_sha256="fixture")
     trainer.fit()
     state = load_v11_checkpoint(tmp_path / "last.pt")
     restored = ControlTrainer(control_model(config["model"], variant, debug=True), config, ds,
-                               torch.device("cpu"), control_protocol=protocol, samples_per_epoch=2, data_manifest_sha256="fixture")
+                               torch.device("cpu"), control_protocol=protocol, data_manifest_sha256="fixture")
     restored.resume(state)
-    assert restored.global_step == 1 and restored.start_epoch == 1
+    assert restored.global_step == 1 and restored.samples_seen == 2
     assert state["evaluation_variant"] == variant
     mismatched = deepcopy(state)
     mismatched["control_provenance"]["reference_checkpoint_sha256"] = "other"
@@ -221,7 +229,12 @@ def test_completed_fixture_evaluation_writes_required_outputs(tmp_path, monkeypa
     from market_jepa_v1_1.model import MarketJEPAV11
     config = _dataset_config()
     config["data"].update(anchor_stride=200, train_commodities=["FG"], root=str(tmp_path))
-    config["training"]["max_epochs"] = 1
+    config["training"].update(
+        max_optimizer_steps=1,
+        warmup_optimizer_steps=1,
+        checkpoint_every_optimizer_steps=1,
+        progress_every_optimizer_steps=1,
+    )
     (tmp_path / "build_manifest.json").write_text("{}")
     data_hash = file_hash(tmp_path / "build_manifest.json")
     ds = V11ContractDataset(_make_store(), config)
@@ -236,10 +249,19 @@ def test_completed_fixture_evaluation_writes_required_outputs(tmp_path, monkeypa
     checkpoint.parent.mkdir(parents=True); checkpoint.write_bytes(b"fixture checkpoint")
     write_json(checkpoint.parent.parent / "final_summary.json", {"status": "V1_1_FORMAL_TRAINING_PASS", "checkpoint_sha256": file_hash(checkpoint)})
     write_json(checkpoint.parent.parent / "data_audit.json", {"status": "PASS", "held_out_bar_files_opened": False})
-    state = {"v11_config": config, "epoch": 0, "checkpoint_selection": "fixed_budget_final",
-             "sampler": {"num_samples": len(ds)},
+    interval = {"sampling_cycle": 0, "step_start": 1, "step_end": 1,
+                "train_loss": 1., "prediction_loss_h16": 1.,
+                "prediction_loss_h64": 1., "prediction_loss_h256": 1.}
+    state = {"v11_config": config, "training_protocol_version": "fixed_sample_budget_v1",
+             "budget_mode": "fixed_optimizer_steps", "global_step": 1,
+             "max_optimizer_steps": 1, "effective_batch_size": 2,
+             "samples_seen": 2, "target_samples_seen": 2,
+             "warmup_optimizer_steps": 1, "checkpoint_every_optimizer_steps": 1,
+             "sampling_population_sha256": "a" * 64,
+             "checkpoint_selection": "fixed_budget_final",
+             "sampler": {"num_samples": 128},
              "shared_imc_scaler": scaler.to_dict(), "data_manifest_sha256": data_hash,
-             "history": [{"epoch": 0, "train_loss": 1., "prediction_loss_h16": 1., "prediction_loss_h64": 1., "prediction_loss_h256": 1.}],
+             "interval_history": [interval],
              "gradient_connectivity": {"missing": [], "nonfinite": []},
              "v11_implementation_manifest": v11_implementation_manifest(), "v11_implementation_sha256": "fixture"}
     monkeypatch.setattr(runner, "load_v11_checkpoint", lambda _: state)
@@ -299,16 +321,31 @@ def test_latefusion_uses_learned_cls_exactly():
 def test_matched_control_provenance_and_semantic_hashes():
     from market_jepa_v1_1.evaluation.protocol import matched_control_gate, semantic_implementation_gate, control_semantic_hashes
     from market_jepa_v1_1.checkpoint import v11_implementation_manifest
-    protocol = {"variant": "LateFusion", "from_scratch": True, "reference_checkpoint_sha256": "A", "reference_sampler_num_samples": 100}
-    provenance = {k: protocol[k] for k in ("reference_checkpoint_sha256", "reference_sampler_num_samples")}
+    budget = {"protocol_version": "fixed_sample_budget_v1", "budget_mode": "fixed_optimizer_steps",
+              "max_optimizer_steps": 100, "effective_batch_size": 128,
+              "target_samples_seen": 12_800, "warmup_optimizer_steps": 5,
+              "checkpoint_every_optimizer_steps": 10,
+              "sampling_population_sha256": "a" * 64, "sampler_seed": 42}
+    protocol = {"variant": "LateFusion", "from_scratch": True,
+                "reference_checkpoint_sha256": "A",
+                "reference_sampling_population_sha256": "a" * 64,
+                "reference_max_optimizer_steps": 100,
+                "reference_effective_batch_size": 128}
+    provenance = {k: protocol[k] for k in (
+        "reference_checkpoint_sha256", "reference_sampling_population_sha256",
+        "reference_max_optimizer_steps", "reference_effective_batch_size")}
     provenance["control_protocol_sha256"] = digest(protocol)
     state = {"evaluation_variant": "LateFusion", "control_protocol": protocol, "control_provenance": provenance,
-             "control_semantic_hashes": control_semantic_hashes(), "v11_implementation_manifest": v11_implementation_manifest(), "sampler": {"num_samples": 100}}
+             "control_semantic_hashes": control_semantic_hashes(),
+             "v11_implementation_manifest": v11_implementation_manifest()}
     semantic_implementation_gate(state)
-    control = {"control_provenance": provenance, "sampler_num_samples": 100}
-    matched_control_gate(control, {"checkpoint_sha256": "A", "sampler_num_samples": 100})
-    with pytest.raises(ValueError): matched_control_gate(control, {"checkpoint_sha256": "B", "sampler_num_samples": 100})
-    with pytest.raises(ValueError): matched_control_gate(control, {"checkpoint_sha256": "A", "sampler_num_samples": 99})
+    control = {"control_provenance": provenance, "training_budget": budget}
+    matched_control_gate(control, {"checkpoint_sha256": "A", "training_budget": budget})
+    with pytest.raises(ValueError):
+        matched_control_gate(control, {"checkpoint_sha256": "B", "training_budget": budget})
+    changed_budget = deepcopy(budget); changed_budget["max_optimizer_steps"] = 99
+    with pytest.raises(ValueError):
+        matched_control_gate(control, {"checkpoint_sha256": "A", "training_budget": changed_budget})
     for name in state["control_semantic_hashes"]:
         changed = deepcopy(state); changed["control_semantic_hashes"][name] = "changed"
         with pytest.raises(ValueError, match="semantic"): semantic_implementation_gate(changed)
@@ -414,10 +451,15 @@ def test_rb_freeze_and_one_shot_integration(tmp_path, monkeypatch):
     checkpoint = tmp_path / "last.pt"; checkpoint.write_bytes(b"fixture")
     write_json(tmp_path / "build_manifest.json", {})
     data_hash = file_hash(tmp_path / "build_manifest.json")
-    state = {"model_size": "S", "sampler": {"num_samples": 10}, "v11_config": {"data": {"root": str(tmp_path)}}}
+    legacy_budget = {"protocol_version": "legacy_epoch_budget", "budget_mode": "epochs",
+                     "max_epochs": 50, "effective_batch_size": 128, "warmup_ratio": .05}
+    state = {"model_size": "S", "sampler": {"num_samples": 10},
+             "v11_config": {"data": {"root": str(tmp_path)},
+                            "training": {"max_epochs": 50, "batch_size": 64,
+                                         "gradient_accumulation": 2, "warmup_ratio": .05}}}
     monkeypatch.setattr(heldout, "load_v11_checkpoint", lambda _: state)
     directory = tmp_path / "train_eval"
-    protocol = {"model_size": "S", "variant": "Full", "sampler_num_samples": 10,
+    protocol = {"model_size": "S", "variant": "Full", "training_budget": legacy_budget,
                 "checkpoint_sha256": file_hash(checkpoint), "evaluation_code_sha256": "code",
                 "manifest_sha256": "train", "epochs": 50, "scaler_sha256": "scaler", "data_manifest_sha256": data_hash}
     write_json(directory / "summary.json", {"protocol": protocol})
@@ -456,7 +498,12 @@ def test_scaling_report_adjacent_pairs_not_only_vs_s(tmp_path, monkeypatch):
     records = [{"commodity": "FG", "contract_uid": "FG1", "trading_date": "2020-01-01"}]
     for i, (size, gain) in enumerate(zip(("S", "M", "L", "XL"), (.1, .5, .3, .2))):
         directory, rb = tmp_path / size, tmp_path / (size + "_rb")
-        protocol = {"manifest_sha256": "same", "epochs": 50, "scaler_sha256": "same", "evaluation_code_sha256": "same",
+        protocol = {"manifest_sha256": "same", "training_budget": {
+                        "protocol_version": "fixed_sample_budget_v1",
+                        "max_optimizer_steps": 250_000,
+                        "effective_batch_size": 128,
+                        "sampling_population_sha256": "same",
+                    }, "scaler_sha256": "same", "evaluation_code_sha256": "same",
                     "data_manifest_sha256": "same", "training_protocol": {"batch_size": 64, "gradient_accumulation": 2},
                     "model_size": size, "variant": "Full", "trainable_params": i + 1, "checkpoint_sha256": size}
         write_json(directory / "summary.json", {"protocol": protocol, "Gain_ALL": {"point": gain}, "Skill_ALL": {"point": gain}, "RB": "NOT_RUN"})

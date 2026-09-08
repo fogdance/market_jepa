@@ -114,6 +114,7 @@ class V11WandbLogger:
             self.run = backend.init(**init_kwargs)
             self.run_id = str(getattr(self.run, "id", resume_run_id or "")) or None
             self.run.define_metric("global_step")
+            self.run.define_metric("samples_seen")
             for namespace in ("train/*", "optim/*", "perf/*"):
                 self.run.define_metric(namespace, step_metric="global_step")
             self.run.define_metric("epoch")
@@ -139,6 +140,7 @@ class V11WandbLogger:
         self,
         *,
         global_step: int,
+        samples_seen: int | None = None,
         loss: float,
         h16_loss: float,
         h64_loss: float,
@@ -155,6 +157,7 @@ class V11WandbLogger:
             return
         self._step_buffer.append({
             "global_step": int(global_step),
+            "samples_seen": int(samples_seen) if samples_seen is not None else int(global_step) * int(samples),
             "loss": float(loss),
             "h16_loss": float(h16_loss),
             "h64_loss": float(h64_loss),
@@ -182,6 +185,7 @@ class V11WandbLogger:
             grad_norms = [float(value["grad_norm"]) for value in values if value["grad_norm"] is not None]
             payload: dict[str, float | int] = {
                 "global_step": int(values[-1]["global_step"]),
+                "samples_seen": int(values[-1]["samples_seen"]),
                 "train/loss": sum(float(value["loss"]) for value in values) / count,
                 "train/h16_loss": sum(float(value["h16_loss"]) for value in values) / count,
                 "train/h64_loss": sum(float(value["h64_loss"]) for value in values) / count,
@@ -201,6 +205,15 @@ class V11WandbLogger:
                 payload["perf/reserved_vram_gb"] = max(reserved) / BYTES_PER_GIB
             self.run.log(payload)
             self._step_buffer.clear()
+        except Exception as error:
+            self._disable_after("step logging", error)
+
+    def log_metrics(self, payload: dict[str, Any]) -> None:
+        """Mirror an already-aggregated local metric record without recomputing it."""
+        if not self.active:
+            return
+        try:
+            self.run.log(dict(payload))
         except Exception as error:
             self._disable_after("step logging", error)
 

@@ -15,7 +15,7 @@ from market_jepa_v1_1.training import model_inputs
 from .controls import control_model
 from .metrics import bootstrap, cosine_loss, predictive_status
 from .probe import context_features, fit_probe, future_outcomes, minute_raw24, multiscale_summary, predict_probe
-from .protocol import HORIZONS, PROTOCOL, build_manifest, digest, evaluation_code_hash, file_hash, final_checkpoint_gate, validate_manifest, write_json, verify_data_files, completed_run_gate, semantic_implementation_gate
+from .protocol import HORIZONS, PROTOCOL, build_manifest, digest, evaluation_code_hash, file_hash, final_checkpoint_gate, validate_manifest, write_json, verify_data_files, completed_run_gate, semantic_implementation_gate, training_budget_provenance
 from .structure import REMOVALS, donor_manifest, remove_sources, replace_channels
 
 
@@ -220,15 +220,15 @@ def evaluate(checkpoint, manifest_path, output, *, device="cpu", batch_size=8):
                 "implementation_sha256": state["v11_implementation_sha256"],
                 "evaluation_code_sha256": evaluation_code_hash(), "scaler_sha256": scaler.checksum,
                 "manifest_sha256": manifest["sha256"], "variant": variant,
-                "model_size": state.get("model_size", "S"), "epochs": config["training"]["max_epochs"],
+                "model_size": state.get("model_size", "S"),
                 "trainable_params": state.get("trainable_parameter_count"),
                 "data_manifest_sha256": state["data_manifest_sha256"],
+                "training_budget": training_budget_provenance(state),
                 "training_protocol": {k: config["training"][k] for k in (
                     "seed", "optimizer", "learning_rate", "weight_decay", "gradient_accumulation",
-                    "batch_size", "max_epochs", "ema_tau", "amp", "amp_dtype")},
+                    "batch_size", "ema_tau", "amp", "amp_dtype")},
                 "rb_test_consumed": False, "precision": "float32", "protocol": PROTOCOL}
     protocol["completion_gate"] = completion
-    protocol["sampler_num_samples"] = state["sampler"]["num_samples"]
     if variant != "Full":
         protocol["control_provenance"] = state["control_provenance"]
     protocol["data_integrity"] = data_integrity

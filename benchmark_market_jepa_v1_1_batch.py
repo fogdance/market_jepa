@@ -90,7 +90,10 @@ def benchmark_profile(
     config["training"].update(
         batch_size=plan["batch_size"],
         gradient_accumulation=plan["gradient_accumulation"],
-        max_epochs=1,
+        max_optimizer_steps=warmup_updates + measured_updates,
+        warmup_optimizer_steps=1,
+        checkpoint_every_optimizer_steps=warmup_updates + measured_updates,
+        progress_every_optimizer_steps=warmup_updates + measured_updates,
         num_workers=num_workers,
         checkpoint_dir="artifacts/performance/v1_1_batch_sweep_unused_checkpoints",
     )
@@ -99,10 +102,9 @@ def benchmark_profile(
     total_updates = warmup_updates + measured_updates
     trainer = V11Trainer(
         model, config, dataset, torch.device("cuda"), validation_dataset=None,
-        samples_per_epoch=plan["effective_batch"] * total_updates,
         data_manifest_sha256="bounded-throughput-sweep",
     )
-    iterator = iter(trainer.train_loader)
+    iterator = iter(trainer._cycle_loader())
     trainer.model.train()
     trainer.optimizer.zero_grad(set_to_none=True)
     measured_times: list[float] = []

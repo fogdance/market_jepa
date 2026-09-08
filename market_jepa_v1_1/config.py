@@ -61,6 +61,27 @@ PROFILE_TRAINING: dict[str, dict[str, int | bool]] = {
     "XL": {"batch_size": 64, "gradient_accumulation": 2, "gradient_checkpointing": True},
 }
 
+FIXED_BUDGET_PROTOCOL = "fixed_sample_budget_v1"
+FORMAL_MAX_OPTIMIZER_STEPS = 250_000
+FORMAL_WARMUP_OPTIMIZER_STEPS = 12_500
+FORMAL_CHECKPOINT_INTERVAL = 5_000
+FORMAL_PROGRESS_INTERVAL = 200
+
+_V11_TRAINING = deepcopy(DEFAULT_CONFIG["training"])
+_V11_TRAINING.pop("max_epochs")
+_V11_TRAINING.pop("warmup_ratio")
+_V11_TRAINING.update({
+    "protocol_version": FIXED_BUDGET_PROTOCOL,
+    "budget_mode": "fixed_optimizer_steps",
+    "max_optimizer_steps": FORMAL_MAX_OPTIMIZER_STEPS,
+    "warmup_optimizer_steps": FORMAL_WARMUP_OPTIMIZER_STEPS,
+    "checkpoint_every_optimizer_steps": FORMAL_CHECKPOINT_INTERVAL,
+    "progress_every_optimizer_steps": FORMAL_PROGRESS_INTERVAL,
+    "num_workers": 8,
+    "gradient_checkpointing": False,
+    "amp_dtype": "bfloat16",
+})
+
 DEFAULT_V11_CONFIG: dict[str, Any] = {
     "design_version": "1.1",
     "model_size": "S",
@@ -107,11 +128,7 @@ DEFAULT_V11_CONFIG: dict[str, Any] = {
         "dropout": 0.1,
         "commodity_embedding": False,
     },
-    "training": {
-        **deepcopy(DEFAULT_CONFIG["training"]), "num_workers": 8,
-        "gradient_checkpointing": False,
-        "amp_dtype": "bfloat16",
-    },
+    "training": deepcopy(_V11_TRAINING),
     "development": {
         "optimizer_steps": 100,
         "batch_size": 2,
@@ -123,7 +140,7 @@ DEFAULT_V11_CONFIG: dict[str, Any] = {
             "enabled": True,
             "mode": "online",
             "project": "market-jepa",
-            "group": "v1.1-formal",
+            "group": "v1.1-formal-fixed-budget-v1",
             "entity": None,
             "run_name": None,
             "log_every_optimizer_steps": 50,
@@ -228,11 +245,23 @@ def validate_v11_config(config: dict[str, Any]) -> None:
     if history["series_mode"] != "same_delivery_month":
         raise ValueError("V1.1 requires history_week.series_mode=same_delivery_month")
     training = config["training"]
-    if (
-        isinstance(training.get("max_epochs"), bool)
-        or not isinstance(training.get("max_epochs"), int)
-        or training["max_epochs"] <= 0
-    ):
+    fixed_budget = training.get("protocol_version") == FIXED_BUDGET_PROTOCOL
+    legacy_budget = "protocol_version" not in training and "max_epochs" in training and "warmup_ratio" in training
+    if not fixed_budget and not legacy_budget:
+        raise ValueError("training protocol must be fixed_sample_budget_v1 or a legacy epoch checkpoint config")
+    if fixed_budget:
+        if training.get("budget_mode") != "fixed_optimizer_steps":
+            raise ValueError("fixed_sample_budget_v1 requires budget_mode=fixed_optimizer_steps")
+        for name in ("max_optimizer_steps", "warmup_optimizer_steps", "checkpoint_every_optimizer_steps",
+                     "progress_every_optimizer_steps"):
+            value = training.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"training.{name} must be a positive integer")
+        if training["warmup_optimizer_steps"] > training["max_optimizer_steps"]:
+            raise ValueError("warmup optimizer steps exceed total budget")
+        if "max_epochs" in training or "warmup_ratio" in training:
+            raise ValueError("fixed_sample_budget_v1 forbids max_epochs/warmup_ratio")
+    elif isinstance(training.get("max_epochs"), bool) or not isinstance(training.get("max_epochs"), int) or training["max_epochs"] <= 0:
         raise ValueError("training.max_epochs must be a positive integer")
     if not isinstance(training.get("gradient_checkpointing", False), bool):
         raise ValueError("training.gradient_checkpointing must be boolean")
@@ -241,9 +270,11 @@ def validate_v11_config(config: dict[str, Any]) -> None:
         raise ValueError("training.amp_dtype must be float16 or bfloat16")
     for name in ("optimizer", "learning_rate", "weight_decay", "betas", "eps", "ema_tau",
                  "lambda_var", "lambda_cov", "variance_floor", "gradient_clip_norm",
-                 "scheduler", "warmup_ratio"):
+                 "scheduler"):
         if training[name] != DEFAULT_CONFIG["training"][name]:
             raise ValueError(f"V1.1 preserves V0 training field {name}")
+    if legacy_budget and training["warmup_ratio"] != DEFAULT_CONFIG["training"]["warmup_ratio"]:
+        raise ValueError("V1.1 preserves V0 training field warmup_ratio")
     development = config["development"]
     if not 100 <= development["optimizer_steps"] <= 500:
         raise ValueError("development optimizer_steps must be 100-500")

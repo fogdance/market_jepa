@@ -4,15 +4,17 @@
 
 V1.1 is implemented as a separate `market_jepa_v1_1` package. V0/design 0.6.1 source, configuration, checkpoint contract, evaluation and training entrypoint are unchanged. V1.0 receives only the two required corrections: its terminal no-loss feedback module is no longer instantiated, and validation JEPA H64 cannot select a checkpoint.
 
-This implementation stage does not start the formal 50-epoch run or RB evaluation.
+This implementation stage does not start the formal fixed-sample-budget run or RB evaluation.
 
 The separate formal entrypoint is `train_market_jepa_v1_1.py`; the development
 entrypoint remains bounded smoke only. Formal training runs all Train-only data
 hard gates, loads every eligible FG/SA/JM/SH/SP episode, fits one deterministic
 shared scaler, rebuilds a new scaled dataset, and uses the hierarchical sampler
-for the epoch budget configured by `training.max_epochs`. It writes only `last.pt` under
-`artifacts/training/v1_1_formal/checkpoints`, supports strict `--resume`, and
-never constructs a validation loader or opens an RB bar file.
+under `fixed_sample_budget_v1`: 250,000 successful optimizer updates with effective
+batch 128 (32,000,000 sample exposures), 12,500 warmup updates, and a recovery
+checkpoint every 5,000 updates. `len(dataset)` no longer determines training
+duration. The runner atomically overwrites `last.pt`, supports strict step-based
+`--resume`, and never constructs a validation loader or opens an RB bar file.
 
 The commodity population is read from `data.train_commodities`, and the held-out
 commodity from `data.held_out_commodity`; dataset eligibility, audits, shared
@@ -154,7 +156,7 @@ The sole formal checkpoint policy is `fixed_budget_final`; `last.pt` at the fina
 
 ## Sampler, parameters and production integration
 
-`HierarchicalCommodityContractSampler` draws uniformly in the order Commodity → eligible Contract episode → Anchor and supports deterministic seed plus epoch state. It validates that every episode in its hierarchy belongs to the dataset's precomputed eligible set. RB is held out from scaler fitting, optimization, architecture selection and checkpoint selection.
+`HierarchicalCommodityContractSampler` draws uniformly in the order Commodity → eligible Contract episode → Anchor and supports deterministic seed plus sampling-cycle state. It validates that every episode in its hierarchy belongs to the dataset's precomputed eligible set. RB is held out from scaler fitting, optimization, architecture selection and checkpoint selection.
 
 Trainable parameter counts are:
 

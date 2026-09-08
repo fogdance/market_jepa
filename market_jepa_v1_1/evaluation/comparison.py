@@ -67,7 +67,7 @@ def compare_runs(directories, output, rb_directories=None):
     rows, comparisons = [], []
     for run in runs:
         p, summary, protocol, records, errors = run
-        for key in ("manifest_sha256", "epochs", "scaler_sha256", "evaluation_code_sha256", "data_manifest_sha256"):
+        for key in ("manifest_sha256", "scaler_sha256", "evaluation_code_sha256", "data_manifest_sha256", "training_budget"):
             if protocol[key] != reference[2][key]:
                 raise ValueError(f"unmatched comparison: {key}")
         left_training, right_training = dict(protocol["training_protocol"]), dict(reference[2]["training_protocol"])

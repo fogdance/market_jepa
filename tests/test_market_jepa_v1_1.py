@@ -27,7 +27,7 @@ from market_jepa_v1_1.checkpoint import (
     v11_implementation_manifest,
 )
 from market_jepa_v1_1.formal_training import (
-    EPOCH_FIELDS, _bar_audit_failure_description,
+    INTERVAL_FIELDS, _bar_audit_failure_description,
     _filter_train_commodities_by_bar_audit, _filter_train_commodities_by_dataset,
     _filter_train_commodities_by_history, validate_formal_training_config,
 )
@@ -831,10 +831,15 @@ def test_v11_collate_keeps_metadata_outside_model(contract_dataset):
 
 class _TrainerDataset(torch.utils.data.Dataset):
     def __init__(self) -> None:
+        self.config = deepcopy(DEFAULT_V11_CONFIG)
+        self.train_commodities = TRAIN_COMMODITIES
         self.scaler = SharedIMCScaler.fit(_scaler_population())
         self.episode_arrays = [
             SimpleNamespace(
-                episode=SimpleNamespace(commodity=commodity, key=(commodity, f"X{index}", 0)),
+                episode=SimpleNamespace(
+                    commodity=commodity, contract_uid=f"X{index}", episode_id=0,
+                    key=(commodity, f"X{index}", 0),
+                ),
                 anchors=np.arange(1),
             )
             for index, commodity in enumerate(TRAIN_COMMODITIES)
@@ -894,8 +899,10 @@ def _trainer_config(path) -> dict:
         predictor_hidden=32, dropout=0.0,
     )
     config["training"].update(
-        batch_size=2, gradient_accumulation=1, max_epochs=1, num_workers=0,
-        amp=False, checkpoint_dir=str(path),
+        batch_size=2, gradient_accumulation=1, max_optimizer_steps=1,
+        warmup_optimizer_steps=1, checkpoint_every_optimizer_steps=1,
+        progress_every_optimizer_steps=1, num_workers=0, amp=False,
+        checkpoint_dir=str(path),
     )
     return config
 
@@ -908,7 +915,7 @@ def trained_v11_checkpoint(tmp_path_factory):
     model = MarketJEPAV11(config["model"], debug=True)
     trainer = V11Trainer(
         model, config, dataset, torch.device("cpu"),
-        validation_dataset=dataset, samples_per_epoch=2, data_manifest_sha256="synthetic-data",
+        validation_dataset=dataset, data_manifest_sha256="synthetic-data",
     )
     trainer.fit()
     return path, config, dataset, model, trainer
@@ -921,9 +928,11 @@ def test_v11_fixed_budget_checkpoint_only(trained_v11_checkpoint):
     assert not list(path.glob("best*"))
     state = load_v11_checkpoint(path / "last.pt")
     assert state["checkpoint_selection"] == "fixed_budget_final"
-    assert state["history"][0]["validation"] is not None
-    assert set(EPOCH_FIELDS) <= set(state["history"][0])
-    assert state["history"][0]["optimizer_steps_this_epoch"] == 1
+    assert state["interval_history"][0]["validation"] is None
+    assert set(INTERVAL_FIELDS) <= set(state["interval_history"][0])
+    assert state["interval_history"][0]["optimizer_steps"] == 1
+    assert state["global_step"] == 1
+    assert state["samples_seen"] == 2
     assert state["daily_truncation_count"] == 2
     assert state["daily_truncated_tokens"] == 6
     assert state["model_size"] == "DEBUG"
@@ -961,10 +970,11 @@ def test_v11_formal_training_contract_is_frozen():
     changed = deepcopy(config); changed["training"]["batch_size"] = 32
     with pytest.raises(ValueError, match="training configuration mismatch"):
         validate_formal_training_config(changed)
-    changed = deepcopy(config); changed["training"]["max_epochs"] = 100
-    validate_formal_training_config(changed)
-    changed = deepcopy(config); changed["training"]["max_epochs"] = 0
-    with pytest.raises(ValueError, match="max_epochs must be a positive integer"):
+    changed = deepcopy(config); changed["training"]["max_optimizer_steps"] = 100_000
+    with pytest.raises(ValueError, match="training configuration mismatch"):
+        validate_formal_training_config(changed)
+    changed = deepcopy(config); changed["training"]["max_optimizer_steps"] = 0
+    with pytest.raises(ValueError, match="max_optimizer_steps must be a positive integer"):
         validate_formal_training_config(changed)
 
 
@@ -980,7 +990,7 @@ def test_v11_multiworker_runtime_reports_truncation(tmp_path):
     dataset = _TrainerDataset()
     trainer = V11Trainer(
         MarketJEPAV11(config["model"], debug=True), config, dataset, torch.device("cpu"),
-        samples_per_epoch=2, data_manifest_sha256="synthetic-data",
+        data_manifest_sha256="synthetic-data",
     )
     trainer.fit()
     assert trainer.daily_truncation_count == 2
@@ -1171,13 +1181,13 @@ def test_v11_resume_roundtrip(trained_v11_checkpoint):
     restored_model = MarketJEPAV11(config["model"], debug=True)
     restored = V11Trainer(
         restored_model, config, dataset, torch.device("cpu"),
-        validation_dataset=dataset, samples_per_epoch=2, data_manifest_sha256="synthetic-data",
+        validation_dataset=dataset, data_manifest_sha256="synthetic-data",
     )
     restored.resume(state)
     assert restored.global_step == trainer.global_step
-    assert restored.start_epoch == 1
     assert restored.history == trainer.history
-    assert restored.sampler.state_dict() == trainer.sampler.state_dict()
+    assert restored.global_step == restored.max_optimizer_steps
+    assert restored.samples_seen == trainer.samples_seen
 
 
 def test_v11_formal_amp_dtype_is_bfloat16():
@@ -1376,7 +1386,7 @@ def test_v11_trainer_emits_successful_optimizer_step_metrics(tmp_path):
     recorder = StepRecorder()
     trainer = V11Trainer(
         MarketJEPAV11(config["model"], debug=True), config, dataset, torch.device("cpu"),
-        samples_per_epoch=2, data_manifest_sha256="synthetic-data",
+        data_manifest_sha256="synthetic-data",
         step_logger=recorder, wandb_run_id="tracking-id",
     )
     history = trainer.fit()
@@ -1391,3 +1401,347 @@ def test_v11_trainer_emits_successful_optimizer_step_metrics(tmp_path):
         )
     state = load_v11_checkpoint(tmp_path / "last.pt")
     assert state["wandb_run_id"] == "tracking-id"
+
+
+class _FixedBudgetDataset(torch.utils.data.Dataset):
+    """Small deterministic sampler/trainer fixture with configurable population size."""
+
+    def __init__(self, commodities=("FG", "SA"), anchors_per_episode: int = 3) -> None:
+        self.train_commodities = tuple(commodities)
+        self.held_out_commodity = "RB"
+        self.config = deepcopy(DEFAULT_V11_CONFIG)
+        self.config["data"]["train_commodities"] = list(self.train_commodities)
+        values = np.arange(18, dtype=np.float32).reshape(2, 9) + 1
+        valid = np.ones_like(values, dtype=np.bool_)
+        population = [
+            (commodity, "minute", values + index, valid)
+            for index, commodity in enumerate(self.train_commodities)
+        ]
+        self.scaler = SharedIMCScaler.fit(
+            population,
+            expected_commodities=self.train_commodities,
+            held_out_commodity=self.held_out_commodity,
+        )
+        self.episode_arrays = []
+        self._offsets = []
+        offset = 0
+        for index, commodity in enumerate(self.train_commodities):
+            anchors = np.arange(anchors_per_episode, dtype=np.int64)
+            self._offsets.append(offset)
+            offset += len(anchors)
+            self.episode_arrays.append(SimpleNamespace(
+                episode=SimpleNamespace(
+                    commodity=commodity, contract_uid=f"{commodity}X", episode_id=0,
+                    key=(commodity, f"{commodity}X", 0),
+                ),
+                anchors=anchors,
+            ))
+        self._length = offset
+        self.eligible_contracts_by_commodity = {
+            commodity: ((commodity, f"{commodity}X", 0),)
+            for commodity in self.train_commodities
+        }
+
+    @property
+    def hierarchy(self):
+        return {commodity: [index] for index, commodity in enumerate(self.train_commodities)}
+
+    def global_index(self, episode_index, local_anchor_index):
+        return self._offsets[episode_index] + int(local_anchor_index)
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, index):
+        episode_index = max(i for i, offset in enumerate(self._offsets) if offset <= index)
+        commodity = self.train_commodities[episode_index]
+        generator = torch.Generator().manual_seed(10_000 + index)
+        sample = {}
+        lengths = {"minute": 2, "daily": 2, "current_weekly": 2, "history_weekly": 2}
+        contexts = {
+            "minute": len(MINUTE_CONTEXT_FEATURES), "daily": len(DAILY_CONTEXT_FEATURES),
+            "current_weekly": len(WEEKLY_CONTEXT_FEATURES),
+            "history_weekly": len(WEEKLY_CONTEXT_FEATURES),
+        }
+        for source, length in lengths.items():
+            sample[f"{source}_market"] = torch.randn(length, len(IMC_FEATURES), generator=generator)
+            sample[f"{source}_context"] = torch.randn(length, contexts[source], generator=generator)
+            sample[f"{source}_mask"] = torch.zeros(length, dtype=torch.bool)
+            sample[f"{source}_imc_validity"] = torch.ones(length, len(IMC_FEATURES), dtype=torch.bool)
+        sample["history_weekly_contract_boundary"] = torch.tensor([1.0, 0.0])
+        sample["target_minute_market"] = {
+            h: torch.randn(2, len(IMC_FEATURES), generator=generator) for h in (16, 64, 256)
+        }
+        sample["target_minute_imc_validity"] = {
+            h: torch.ones(2, len(IMC_FEATURES), dtype=torch.bool) for h in (16, 64, 256)
+        }
+        sample["target_minute_mask"] = {h: torch.zeros(2, dtype=torch.bool) for h in (16, 64, 256)}
+        sample["metadata"] = {
+            "commodity": commodity, "contract_uid": f"{commodity}X",
+            "daily_was_truncated": False, "daily_truncated_tokens": 0,
+        }
+        return sample
+
+
+class _TinyFixedBudgetModel(torch.nn.Module):
+    """Fast stochastic model used to verify exact fixed-budget resume semantics."""
+
+    def __init__(self, architecture_config: dict) -> None:
+        super().__init__()
+        self.architecture_config = deepcopy(architecture_config)
+        self.model_size = "DEBUG"
+        self.horizons = (16, 64, 256)
+        width = 4
+        self.online = torch.nn.Linear(len(IMC_FEATURES), width)
+        self.dropout = torch.nn.Dropout(0.25)
+        self.target_minute = torch.nn.Linear(len(IMC_FEATURES), width, bias=False)
+        self.target_minute.weight.data.copy_(self.online.weight.data)
+        self.target_minute.requires_grad_(False)
+
+    def set_gradient_checkpointing(self, _enabled: bool) -> None:
+        return None
+
+    def optimizer_parameters(self):
+        return self.online.parameters()
+
+    @torch.no_grad()
+    def update_target(self, tau: float) -> None:
+        self.target_minute.weight.mul_(tau).add_(self.online.weight, alpha=1.0 - tau)
+
+    def forward(self, **batch):
+        source = batch["minute_market"].mean(dim=1)
+        z = self.dropout(self.online(source))
+        predictions = {h: z for h in self.horizons}
+        with torch.no_grad():
+            targets = {
+                h: self.target_minute(batch["target_minute_market"][h].mean(dim=1))
+                for h in self.horizons
+            }
+        return {"z_market": z, "predictions": predictions, "targets": targets}
+
+
+def _fixed_budget_test_config(path, *, max_steps=6, checkpoint_every=4, commodities=("FG", "SA")):
+    config = _trainer_config(path)
+    config["data"]["train_commodities"] = list(commodities)
+    allowed_history = set(commodities) | {config["data"]["held_out_commodity"]}
+    config["history_week"]["commodity_years"] = {
+        commodity: years
+        for commodity, years in config["history_week"]["commodity_years"].items()
+        if commodity in allowed_history
+    }
+    config["training"].update(
+        max_optimizer_steps=max_steps,
+        warmup_optimizer_steps=min(2, max_steps),
+        checkpoint_every_optimizer_steps=checkpoint_every,
+        progress_every_optimizer_steps=max_steps,
+        batch_size=2,
+        gradient_accumulation=1,
+        num_workers=0,
+        amp=False,
+    )
+    return config
+
+
+def _assert_tensor_state_equal(left, right):
+    assert left.keys() == right.keys()
+    for key in left:
+        if isinstance(left[key], torch.Tensor):
+            torch.testing.assert_close(left[key], right[key], rtol=0, atol=0)
+        elif isinstance(left[key], dict):
+            _assert_tensor_state_equal(left[key], right[key])
+        elif isinstance(left[key], list):
+            assert len(left[key]) == len(right[key])
+            for a, b in zip(left[key], right[key]):
+                if isinstance(a, dict):
+                    _assert_tensor_state_equal(a, b)
+                elif isinstance(a, torch.Tensor):
+                    torch.testing.assert_close(a, b, rtol=0, atol=0)
+                else:
+                    assert a == b
+        else:
+            assert left[key] == right[key]
+
+
+def test_fixed_budget_duration_is_independent_of_dataset_length(tmp_path):
+    for anchors in (1, 25):
+        dataset = _FixedBudgetDataset(anchors_per_episode=anchors)
+        config = _fixed_budget_test_config(tmp_path / f"len-{anchors}", max_steps=3, checkpoint_every=2)
+        model = _TinyFixedBudgetModel(config["model"])
+        trainer = V11Trainer(model, config, dataset, torch.device("cpu"), data_manifest_sha256="fixture")
+        trainer.fit()
+        assert trainer.global_step == 3
+        assert trainer.samples_seen == 3 * trainer.effective_batch_size
+        assert trainer.target_samples_seen == 3 * trainer.effective_batch_size
+
+
+def test_fixed_budget_duration_is_independent_of_commodity_count(tmp_path):
+    for commodities in (("FG", "SA"), ("FG", "SA", "JM", "SH")):
+        dataset = _FixedBudgetDataset(commodities=commodities, anchors_per_episode=2)
+        config = _fixed_budget_test_config(
+            tmp_path / f"commodities-{len(commodities)}", max_steps=3, checkpoint_every=2,
+            commodities=commodities,
+        )
+        trainer = V11Trainer(
+            _TinyFixedBudgetModel(config["model"]), config, dataset, torch.device("cpu"),
+            data_manifest_sha256="fixture",
+        )
+        trainer.fit()
+        assert trainer.global_step == 3
+        assert trainer.samples_seen == 6
+
+
+def test_fixed_budget_sampler_cycle_offset_and_cross_model_parity():
+    from market_jepa_v1_1.sampler import sampling_population_sha256
+
+    dataset = _FixedBudgetDataset(anchors_per_episode=7)
+    digest = sampling_population_sha256(dataset, "fixture")
+    first = HierarchicalCommodityContractSampler(
+        dataset, 40, 42, dataset.train_commodities, sampling_population_sha256=digest,
+    )
+    second = HierarchicalCommodityContractSampler(
+        dataset, 40, 42, dataset.train_commodities, sampling_population_sha256=digest,
+    )
+    first.configure_cycle(3, 40, 0)
+    second.configure_cycle(3, 40, 0)
+    full = list(first)
+    assert full == list(second)
+
+    resumed = HierarchicalCommodityContractSampler(
+        dataset, 40, 42, dataset.train_commodities, sampling_population_sha256=digest,
+    )
+    resumed.configure_cycle(3, 40, 13)
+    assert list(resumed) == full[13:]
+
+    reordered = _FixedBudgetDataset(commodities=("SA", "FG"), anchors_per_episode=7)
+    assert sampling_population_sha256(reordered, "fixture") != digest
+
+
+def test_fixed_budget_periodic_checkpoint_steps(tmp_path, monkeypatch):
+    import market_jepa_v1_1.training as training_module
+
+    dataset = _FixedBudgetDataset(anchors_per_episode=4)
+    config = _fixed_budget_test_config(tmp_path, max_steps=12, checkpoint_every=5)
+    trainer = V11Trainer(
+        _TinyFixedBudgetModel(config["model"]), config, dataset, torch.device("cpu"),
+        data_manifest_sha256="fixture",
+    )
+    real_save = training_module.save_checkpoint
+    saved_steps = []
+
+    def recording_save(state, path):
+        saved_steps.append(int(state["global_step"]))
+        return real_save(state, path)
+
+    monkeypatch.setattr(training_module, "save_checkpoint", recording_save)
+    trainer.fit()
+    assert saved_steps == [5, 10, 12]
+    state = load_v11_checkpoint(tmp_path / "last.pt")
+    assert state["global_step"] == 12
+    assert state["samples_seen"] == 24
+
+
+def test_fixed_budget_resume_matches_uninterrupted_mid_cycle(tmp_path):
+    dataset = _FixedBudgetDataset(anchors_per_episode=5)
+    full_config = _fixed_budget_test_config(tmp_path / "full", max_steps=6, checkpoint_every=4)
+    split_config = _fixed_budget_test_config(tmp_path / "split", max_steps=6, checkpoint_every=4)
+
+    torch.manual_seed(777)
+    initial = _TinyFixedBudgetModel(full_config["model"]).state_dict()
+
+    full_model = _TinyFixedBudgetModel(full_config["model"])
+    full_model.load_state_dict(initial)
+    torch.manual_seed(12345)
+    full = V11Trainer(full_model, full_config, dataset, torch.device("cpu"), data_manifest_sha256="fixture")
+    full.fit()
+
+    split_model = _TinyFixedBudgetModel(split_config["model"])
+    split_model.load_state_dict(initial)
+    torch.manual_seed(12345)
+    first = V11Trainer(split_model, split_config, dataset, torch.device("cpu"), data_manifest_sha256="fixture")
+    first.fit(stop_after_optimizer_step=3)
+    checkpoint = load_v11_checkpoint(tmp_path / "split" / "last.pt")
+    assert checkpoint["sampling_cycle"] == 0
+    assert checkpoint["sampling_cycle_sample_offset"] == 6
+
+    resumed_model = _TinyFixedBudgetModel(split_config["model"])
+    resumed = V11Trainer(
+        resumed_model, split_config, dataset, torch.device("cpu"), data_manifest_sha256="fixture",
+    )
+    resumed.resume(checkpoint)
+    resumed.fit()
+
+    assert resumed.global_step == full.global_step == 6
+    assert resumed.samples_seen == full.samples_seen == 12
+    _assert_tensor_state_equal(full.model.state_dict(), resumed.model.state_dict())
+    _assert_tensor_state_equal(full.optimizer.state_dict(), resumed.optimizer.state_dict())
+    assert full.scheduler.state_dict() == resumed.scheduler.state_dict()
+
+    full_cycle = full._cycle_position()
+    resumed_cycle = resumed._cycle_position()
+    assert full_cycle == resumed_cycle
+
+
+def test_fixed_budget_legacy_checkpoint_is_evaluation_only(tmp_path):
+    dataset = _FixedBudgetDataset(anchors_per_episode=2)
+    config = _fixed_budget_test_config(tmp_path, max_steps=1, checkpoint_every=1)
+    trainer = V11Trainer(
+        _TinyFixedBudgetModel(config["model"]), config, dataset, torch.device("cpu"),
+        data_manifest_sha256="fixture",
+    )
+    trainer.fit()
+    state = load_v11_checkpoint(tmp_path / "last.pt")
+    legacy = deepcopy(state)
+    training = legacy["v11_config"]["training"]
+    for name in (
+        "protocol_version", "budget_mode", "max_optimizer_steps", "warmup_optimizer_steps",
+        "checkpoint_every_optimizer_steps", "progress_every_optimizer_steps",
+    ):
+        training.pop(name, None)
+    training["max_epochs"] = 1
+    training["warmup_ratio"] = 0.05
+    legacy.pop("training_protocol_version", None)
+    for name in (
+        "budget_mode", "max_optimizer_steps", "effective_batch_size", "samples_seen",
+        "target_samples_seen", "warmup_optimizer_steps", "checkpoint_every_optimizer_steps",
+        "sampling_cycle", "sampling_cycle_sample_offset", "sampling_population_sha256",
+        "interval_history",
+    ):
+        legacy.pop(name, None)
+    legacy["epoch"] = 0
+    legacy["history"] = []
+    legacy["sampler"] = {"seed": 42, "epoch": 0, "num_samples": 2}
+    validate_v11_checkpoint(legacy)
+
+    restored = V11Trainer(
+        _TinyFixedBudgetModel(config["model"]), config, dataset, torch.device("cpu"),
+        data_manifest_sha256="fixture",
+    )
+    with pytest.raises(ValueError, match="Cannot resume legacy epoch-budget checkpoint"):
+        restored.resume(legacy)
+
+
+def test_fixed_budget_scheduler_golden_points():
+    from market_jepa_v1_1.training import fixed_budget_lr_multiplier
+
+    assert fixed_budget_lr_multiplier(0, 10, 4) == pytest.approx(0.25)
+    assert fixed_budget_lr_multiplier(3, 10, 4) == pytest.approx(1.0)
+    assert fixed_budget_lr_multiplier(4, 10, 4) == pytest.approx(1.0)
+    assert fixed_budget_lr_multiplier(7, 10, 4) == pytest.approx(0.5)
+    assert fixed_budget_lr_multiplier(10, 10, 4) == pytest.approx(0.0)
+    assert fixed_budget_lr_multiplier(12_499, 250_000, 12_500) == pytest.approx(1.0)
+    assert fixed_budget_lr_multiplier(250_000, 250_000, 12_500) == pytest.approx(0.0)
+
+
+def test_fixed_budget_checkpoint_rejects_inconsistent_sampler_position(tmp_path):
+    dataset = _FixedBudgetDataset(anchors_per_episode=3)
+    config = _fixed_budget_test_config(tmp_path, max_steps=3, checkpoint_every=2)
+    trainer = V11Trainer(
+        _TinyFixedBudgetModel(config["model"]), config, dataset, torch.device("cpu"),
+        data_manifest_sha256="fixture",
+    )
+    trainer.fit(stop_after_optimizer_step=1)
+    state = load_v11_checkpoint(tmp_path / "last.pt")
+    broken = deepcopy(state)
+    broken["sampler"]["start_offset"] += 2
+    with pytest.raises(ValueError, match="sampler state mismatch"):
+        validate_v11_checkpoint(broken)

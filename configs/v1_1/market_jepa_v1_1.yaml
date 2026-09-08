@@ -50,8 +50,12 @@ training:
   eps: 1.0e-8
   batch_size: 64
   gradient_accumulation: 2
-  max_epochs: 100
-  warmup_ratio: 0.05
+  protocol_version: fixed_sample_budget_v1
+  budget_mode: fixed_optimizer_steps
+  max_optimizer_steps: 250000
+  warmup_optimizer_steps: 12500
+  checkpoint_every_optimizer_steps: 5000
+  progress_every_optimizer_steps: 200
   scheduler: cosine
   gradient_clip_norm: 1.0
   ema_tau: 0.996
@@ -74,7 +78,7 @@ logging:
     enabled: true
     mode: online
     project: market-jepa
-    group: v1.1-formal
+    group: v1.1-formal-fixed-budget-v1
     entity: null
     run_name: null
     log_every_optimizer_steps: 50

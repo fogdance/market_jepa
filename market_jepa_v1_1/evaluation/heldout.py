@@ -13,7 +13,7 @@ from market_jepa_v1_1.imc import SharedIMCScaler
 from .controls import control_model
 from .metrics import bootstrap, predictive_status
 from .probe import predict_probe
-from .protocol import digest, evaluation_code_hash, file_hash, final_checkpoint_gate, validate_manifest, write_json, verify_data_files, completed_run_gate, semantic_implementation_gate
+from .protocol import digest, evaluation_code_hash, file_hash, final_checkpoint_gate, validate_manifest, write_json, verify_data_files, completed_run_gate, semantic_implementation_gate, training_budget_provenance
 from .runner import extract, write_csv
 from .campaign import campaign_plan, exact_cohort
 from .protocol import matched_control_gate
@@ -41,13 +41,13 @@ def freeze(checkpoints, evaluations, manifest_path, output, *, plan_path):
         if (protocol["model_size"] != state.get("model_size", "S") or
                 protocol["variant"] != state.get("evaluation_variant", "Full")):
             raise ValueError("evaluation/checkpoint identity mismatch")
-        if (protocol.get("sampler_num_samples") != state["sampler"]["num_samples"] or
-                (protocol["variant"] != "Full" and protocol.get("control_provenance") != state.get("control_provenance"))):
+        if protocol["training_budget"] != training_budget_provenance(state) or (
+                protocol["variant"] != "Full" and protocol.get("control_provenance") != state.get("control_provenance")):
             raise ValueError("evaluation/checkpoint control provenance mismatch")
         if json.loads((directory / "evaluation_protocol.json").read_text()) != protocol:
             raise ValueError("evaluation summary/protocol mismatch")
         protocols.append(protocol)
-        shared = {key: protocol[key] for key in ("manifest_sha256", "epochs", "scaler_sha256", "data_manifest_sha256")}
+        shared = {key: protocol[key] for key in ("manifest_sha256", "training_budget", "scaler_sha256", "data_manifest_sha256")}
         if common is not None and common != shared:
             raise ValueError("RB campaign training populations/budgets/scalers are unmatched")
         common = shared

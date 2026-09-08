@@ -101,16 +101,25 @@ class ControlTrainer(V11Trainer):
         self.control_protocol = deepcopy(control_protocol)
         self.control_provenance = {
             "reference_checkpoint_sha256": control_protocol["reference_checkpoint_sha256"],
-            "reference_sampler_num_samples": control_protocol["reference_sampler_num_samples"],
+            "reference_sampling_population_sha256": control_protocol["reference_sampling_population_sha256"],
+            "reference_max_optimizer_steps": control_protocol["reference_max_optimizer_steps"],
+            "reference_effective_batch_size": control_protocol["reference_effective_batch_size"],
             "control_protocol_sha256": digest(control_protocol),
         }
         self.control_semantics = control_semantic_hashes()
         super().__init__(*args, **kwargs)
+        expected = {
+            "reference_sampling_population_sha256": self.sampling_population_sha256,
+            "reference_max_optimizer_steps": self.max_optimizer_steps,
+            "reference_effective_batch_size": self.effective_batch_size,
+        }
+        if any(self.control_provenance[name] != value for name, value in expected.items()):
+            raise ValueError("control fixed-budget/sample-stream provenance mismatch")
 
-    def _state(self, epoch):
+    def _state(self):
         if self.control_semantics != control_semantic_hashes():
             raise ValueError("control implementation changed during training")
-        state = super()._state(epoch)
+        state = super()._state()
         state["evaluation_variant"] = self.model.evaluation_variant
         state["control_protocol"] = self.control_protocol
         state["control_provenance"] = self.control_provenance

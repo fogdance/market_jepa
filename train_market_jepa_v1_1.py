@@ -43,7 +43,10 @@ def main() -> None:
         write_failure_summary(args.output, error)
         raise
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    if summary["status"] != "V1_1_FORMAL_TRAINING_PASS":
+    if summary["status"] not in {
+        "V1_1_FIXED_SAMPLE_BUDGET_TRAINING_PASS",
+        "INTERRUPTED_RECOVERY_CHECKPOINT_SAVED",
+    }:
         raise SystemExit(1)
 
 

@@ -15,9 +15,9 @@ from market_jepa.train.checkpoint import save_checkpoint
 from market_jepa.train.trainer import capture_rng_state, restore_rng_state
 
 from .checkpoint import validate_v11_checkpoint, v11_implementation_manifest
-from .config import validate_v11_config
+from .config import FIXED_BUDGET_PROTOCOL, validate_v11_config
 from .dataset import V11ContractDataset, collate_v11_batch
-from .sampler import HierarchicalCommodityContractSampler
+from .sampler import HierarchicalCommodityContractSampler, sampling_population_sha256
 from market_jepa.implementation import manifest_sha256
 
 
@@ -30,7 +30,6 @@ MODEL_INPUT_KEYS = (
     "history_weekly_contract_boundary", "target_minute_market",
     "target_minute_imc_validity", "target_minute_mask",
 )
-PROGRESS_INTERVAL_STEPS = 200
 
 
 def _format_duration(seconds: float) -> str:
@@ -128,6 +127,13 @@ def _stable_total_norm_fp64(parameters: list[torch.nn.Parameter]) -> torch.Tenso
     return total.sqrt()
 
 
+def fixed_budget_lr_multiplier(step: int, total_steps: int, warmup_steps: int) -> float:
+    if warmup_steps and step < warmup_steps:
+        return (step + 1) / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return 0.5 * (1 + math.cos(math.pi * min(max(progress, 0), 1)))
+
+
 def assert_all_trainable_gradients(model) -> dict:
     missing, nonfinite = [], []
     for name, parameter in model.named_parameters():
@@ -148,7 +154,7 @@ class V11Trainer:
     def __init__(
         self, model, config: dict, train_dataset: V11ContractDataset, device: torch.device,
         *, validation_dataset: V11ContractDataset | None = None,
-        samples_per_epoch: int | None = None, data_manifest_sha256: str = "",
+        data_manifest_sha256: str = "", sampling_population_digest: str | None = None,
         step_logger: Any | None = None, wandb_run_id: str | None = None,
     ) -> None:
         validate_v11_config(config)
@@ -161,34 +167,40 @@ class V11Trainer:
         self.train_dataset, self.validation_dataset = train_dataset, validation_dataset
         self.data_manifest_sha256 = str(data_manifest_sha256)
         training = config["training"]
+        if training.get("protocol_version") != FIXED_BUDGET_PROTOCOL:
+            raise ValueError(
+                "V11Trainer only runs fixed_sample_budget_v1; legacy epoch checkpoints are evaluation-only"
+            )
         self.accumulation = int(training["gradient_accumulation"])
-        batch_size = int(training["batch_size"])
-        samples = int(samples_per_epoch or len(train_dataset))
+        self.batch_size = int(training["batch_size"])
+        self.effective_batch_size = self.batch_size * self.accumulation
+        self.max_optimizer_steps = int(training["max_optimizer_steps"])
+        self.warmup_optimizer_steps = int(training["warmup_optimizer_steps"])
+        self.checkpoint_every_optimizer_steps = int(training["checkpoint_every_optimizer_steps"])
+        self.progress_every_optimizer_steps = int(training["progress_every_optimizer_steps"])
+        self.target_samples_seen = self.max_optimizer_steps * self.effective_batch_size
+        actual_population = sampling_population_sha256(train_dataset, self.data_manifest_sha256)
+        if sampling_population_digest is not None and sampling_population_digest != actual_population:
+            raise ValueError("supplied sampling population SHA256 differs from dataset")
+        self.sampling_population_sha256 = actual_population
+        initial_samples = min(self.checkpoint_every_optimizer_steps, self.max_optimizer_steps) * self.effective_batch_size
         self.sampler = HierarchicalCommodityContractSampler(
-            train_dataset, samples, int(training["seed"]),
+            train_dataset, initial_samples, int(training["seed"]),
             commodities=config["data"]["train_commodities"],
-        )
-        self.train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, sampler=self.sampler,
-            collate_fn=collate_v11_batch, num_workers=int(training["num_workers"]),
-            pin_memory=device.type == "cuda",
+            sampling_population_sha256=self.sampling_population_sha256,
         )
         self.validation_loader = None if validation_dataset is None else DataLoader(
-            validation_dataset, batch_size=batch_size, shuffle=False,
+            validation_dataset, batch_size=self.batch_size, shuffle=False,
             collate_fn=collate_v11_batch, num_workers=0,
         )
         self.optimizer = torch.optim.AdamW(
             list(model.optimizer_parameters()), lr=training["learning_rate"],
             weight_decay=training["weight_decay"], betas=tuple(training["betas"]), eps=training["eps"],
         )
-        steps_per_epoch = math.ceil(math.ceil(samples / batch_size) / self.accumulation)
-        total_steps = max(1, steps_per_epoch * int(training["max_epochs"]))
-        warmup = int(total_steps * float(training["warmup_ratio"]))
+        total_steps = self.max_optimizer_steps
+        warmup = self.warmup_optimizer_steps
         def schedule(step: int) -> float:
-            if warmup and step < warmup:
-                return (step + 1) / warmup
-            progress = (step - warmup) / max(1, total_steps - warmup)
-            return 0.5 * (1 + math.cos(math.pi * min(max(progress, 0), 1)))
+            return fixed_budget_lr_multiplier(step, total_steps, warmup)
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, schedule)
         self.amp_enabled = bool(training["amp"] and device.type == "cuda")
         self.amp_dtype_name = str(training.get("amp_dtype", "float16"))
@@ -199,7 +211,9 @@ class V11Trainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.grad_scaler_enabled)
         self.amp_calibrated = not self.grad_scaler_enabled
         self.amp_calibration: list[dict[str, float | bool]] = []
-        self.global_step = 0; self.start_epoch = 0; self.history: list[dict] = []
+        self.global_step = 0; self.samples_seen = 0
+        self.history: list[dict] = []
+        self.interrupted = False
         self.skipped_optimizer_steps = 0
         self.last_grad_norm: float | None = None
         self.step_logger = step_logger
@@ -314,42 +328,58 @@ class V11Trainer:
             f"V1.1 non-finite gradient elements under amp_dtype={self.amp_dtype_name}"
         )
 
-    def _run_epoch(self, loader, training: bool, *, epoch: int | None = None) -> dict[str, float]:
-        self.model.train(training)
+    def _cycle_position(self) -> tuple[int, int, int]:
+        cycle = self.global_step // self.checkpoint_every_optimizer_steps
+        if self.global_step >= self.max_optimizer_steps:
+            return cycle, 0, 0
+        cycle_start = cycle * self.checkpoint_every_optimizer_steps
+        cycle_steps = min(self.checkpoint_every_optimizer_steps, self.max_optimizer_steps - cycle_start)
+        return cycle, cycle_steps * self.effective_batch_size, (self.global_step - cycle_start) * self.effective_batch_size
+
+    def _cycle_loader(self) -> DataLoader:
+        cycle, samples, offset = self._cycle_position()
+        if samples <= 0:
+            raise RuntimeError("cannot create a loader after the fixed optimizer budget")
+        self.sampler.configure_cycle(cycle, samples, offset)
+        generator = torch.Generator().manual_seed(int(self.config["training"]["seed"]) + 1_000_003 * cycle)
+        return DataLoader(
+            self.train_dataset, batch_size=self.batch_size, sampler=self.sampler,
+            collate_fn=collate_v11_batch, num_workers=int(self.config["training"]["num_workers"]),
+            pin_memory=self.device.type == "cuda", generator=generator,
+        )
+
+    def _run_segment(
+        self, loader: DataLoader, expected_optimizer_steps: int,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> tuple[dict[str, float], bool]:
+        self.model.train(True)
         totals = {f"prediction_loss_h{h}": 0.0 for h in self.model.horizons}
-        total_loss, count = 0.0, 0
-        epoch_started = time.perf_counter()
+        total_loss, count, interrupted = 0.0, 0, False
+        segment_started = time.perf_counter()
         optimizer_step = 0
-        optimizer_steps_total = math.ceil(len(loader) / self.accumulation) if training else 0
         step_started = time.perf_counter()
         step_samples = 0
         step_loss = 0.0
         step_horizons = {horizon: 0.0 for horizon in self.model.horizons}
-        if training:
-            self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad(set_to_none=True)
         for index, raw in enumerate(loader):
-            if training:
-                self.daily_truncation_count += sum(
-                    bool(metadata.get("daily_was_truncated", False))
-                    for metadata in raw["metadata"]
-                )
-                self.daily_truncated_tokens += sum(
-                    int(metadata.get("daily_truncated_tokens", 0))
-                    for metadata in raw["metadata"]
-                )
+            self.daily_truncation_count += sum(
+                bool(metadata.get("daily_was_truncated", False)) for metadata in raw["metadata"]
+            )
+            self.daily_truncated_tokens += sum(
+                int(metadata.get("daily_truncated_tokens", 0)) for metadata in raw["metadata"]
+            )
             kwargs = model_inputs(raw, self.device)
-            if training:
-                self._calibrate_amp(kwargs)
-            with (torch.enable_grad() if training else torch.inference_mode()):
-                with torch.amp.autocast(
-                    self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled
-                ):
-                    output = self.model(**kwargs)
-                loss, metrics = jepa_loss_fp32(
-                    output, lambda_var=self.config["training"]["lambda_var"],
-                    lambda_cov=self.config["training"]["lambda_cov"],
-                    variance_floor=self.config["training"]["variance_floor"],
-                )
+            self._calibrate_amp(kwargs)
+            with torch.enable_grad(), torch.amp.autocast(
+                self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled
+            ):
+                output = self.model(**kwargs)
+            loss, metrics = jepa_loss_fp32(
+                output, lambda_var=self.config["training"]["lambda_var"],
+                lambda_cov=self.config["training"]["lambda_cov"],
+                variance_floor=self.config["training"]["variance_floor"],
+            )
             if not torch.isfinite(loss):
                 raise FloatingPointError("V1.1 JEPA loss is nonfinite")
             size = kwargs["minute_market"].shape[0]
@@ -358,30 +388,33 @@ class V11Trainer:
                 horizon: float(metrics[f"prediction_loss_h{horizon}"])
                 for horizon in self.model.horizons
             }
-            if training:
-                step_samples += size
-                step_loss += loss_value * size
-                for horizon in self.model.horizons:
-                    step_horizons[horizon] += horizon_values[horizon] * size
-            if training:
-                self.scaler.scale(loss / self.accumulation).backward()
-                if (index + 1) % self.accumulation == 0 or index + 1 == len(loader):
-                    optimizer_step += 1
-                    self.scaler.unscale_(self.optimizer)
-                    gradients_finite = self._clip_gradients_or_skip()
-                    if gradients_finite and self.gradient_connectivity is None:
-                        self.gradient_connectivity = assert_all_trainable_gradients(self.model)
-                    step_succeeded = self._finish_optimizer_step()
-                    if not gradients_finite and step_succeeded:
-                        raise FloatingPointError(
-                            "V1.1 GradScaler failed to skip an optimizer step with non-finite gradients"
-                        )
-                    if (
-                        step_succeeded and self.step_logger is not None
-                        and getattr(self.step_logger, "active", True)
-                    ):
-                        self.step_logger.log_step(
+            total_loss += loss_value * size
+            count += size
+            for horizon in self.model.horizons:
+                totals[f"prediction_loss_h{horizon}"] += horizon_values[horizon] * size
+            step_samples += size
+            step_loss += loss_value * size
+            for horizon in self.model.horizons:
+                step_horizons[horizon] += horizon_values[horizon] * size
+            self.scaler.scale(loss / self.accumulation).backward()
+            if (index + 1) % self.accumulation == 0:
+                self.scaler.unscale_(self.optimizer)
+                gradients_finite = self._clip_gradients_or_skip()
+                if gradients_finite and self.gradient_connectivity is None:
+                    self.gradient_connectivity = assert_all_trainable_gradients(self.model)
+                step_succeeded = self._finish_optimizer_step()
+                if not gradients_finite and step_succeeded:
+                    raise FloatingPointError("GradScaler applied non-finite gradients")
+                if not step_succeeded:
+                    raise FloatingPointError("fixed sample budget requires every sampled optimizer update to succeed")
+                if step_samples != self.effective_batch_size:
+                    raise RuntimeError("fixed sample budget encountered a partial effective batch")
+                self.samples_seen += step_samples
+                optimizer_step += 1
+                if self.step_logger is not None:
+                    self.step_logger.log_step(
                             global_step=self.global_step,
+                            samples_seen=self.samples_seen,
                             loss=step_loss / step_samples,
                             h16_loss=step_horizons[16] / step_samples,
                             h64_loss=step_horizons[64] / step_samples,
@@ -397,34 +430,48 @@ class V11Trainer:
                             reserved_vram_bytes=(
                                 int(torch.cuda.memory_reserved()) if self.device.type == "cuda" else None
                             ),
-                        )
-                    if (
-                        optimizer_step % PROGRESS_INTERVAL_STEPS == 0
-                        or optimizer_step == optimizer_steps_total
-                    ):
-                        elapsed = time.perf_counter() - epoch_started
-                        eta = elapsed / optimizer_step * (optimizer_steps_total - optimizer_step)
-                        print(
-                            f"epoch={epoch} step={optimizer_step}/{optimizer_steps_total} "
-                            f"{100.0 * optimizer_step / optimizer_steps_total:.1f}% "
+                    )
+                if self.global_step % self.progress_every_optimizer_steps == 0 or self.global_step == self.max_optimizer_steps:
+                    elapsed = time.perf_counter() - segment_started
+                    remaining = self.max_optimizer_steps - self.global_step
+                    eta = elapsed / optimizer_step * remaining if optimizer_step else 0
+                    print(
+                            f"global_step={self.global_step}/{self.max_optimizer_steps} "
+                            f"{100.0 * self.global_step / self.max_optimizer_steps:.1f}% "
+                            f"samples_seen={self.samples_seen}/{self.target_samples_seen} "
                             f"loss={step_loss / step_samples:.8f} "
                             f"lr={float(self.optimizer.param_groups[0]['lr']):.8g} "
                             f"elapsed={_format_duration(elapsed)} ETA={_format_duration(eta)}",
                             flush=True,
-                        )
-                    step_started = time.perf_counter()
-                    step_samples = 0
-                    step_loss = 0.0
-                    step_horizons = {horizon: 0.0 for horizon in self.model.horizons}
-            total_loss += loss_value * size; count += size
-            for horizon in self.model.horizons:
-                totals[f"prediction_loss_h{horizon}"] += horizon_values[horizon] * size
-        return {"loss": total_loss / count, **{key: value / count for key, value in totals.items()}}
+                    )
+                step_started = time.perf_counter()
+                step_samples = 0
+                step_loss = 0.0
+                step_horizons = {horizon: 0.0 for horizon in self.model.horizons}
+                if stop_requested is not None and stop_requested():
+                    interrupted = True
+                    break
+                if optimizer_step >= expected_optimizer_steps:
+                    break
+        if step_samples:
+            raise RuntimeError("training segment ended inside gradient accumulation")
+        if not interrupted and optimizer_step != expected_optimizer_steps:
+            raise RuntimeError(f"training segment produced {optimizer_step} updates, expected {expected_optimizer_steps}")
+        if not count:
+            raise RuntimeError("empty fixed-budget training segment")
+        return ({"loss": total_loss / count, **{key: value / count for key, value in totals.items()},
+                 "optimizer_steps": optimizer_step, "samples": count}, interrupted)
 
-    def _state(self, epoch: int) -> dict:
+    def _state(self) -> dict:
         current = v11_implementation_manifest()
         if manifest_sha256(current) != self.manifest_digest:
             raise RuntimeError("V1.1 implementation changed during training")
+        cycle, cycle_samples, cycle_offset = self._cycle_position()
+        sampler_state = {
+            "seed": self.sampler.seed, "sampling_cycle": cycle,
+            "num_samples": cycle_samples, "start_offset": cycle_offset,
+            "sampling_population_sha256": self.sampling_population_sha256,
+        }
         return {
             "design_version": "1.1", "v11_config": deepcopy(self.config),
             "model_size": self.model.model_size,
@@ -439,9 +486,20 @@ class V11Trainer:
             "architecture_config": deepcopy(self.model.architecture_config),
             "model": self.model.state_dict(), "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(), "scaler": self.scaler.state_dict(),
-            "epoch": epoch, "global_step": self.global_step,
+            "training_protocol_version": self.config["training"]["protocol_version"],
+            "budget_mode": self.config["training"]["budget_mode"],
+            "global_step": self.global_step,
+            "max_optimizer_steps": self.max_optimizer_steps,
+            "effective_batch_size": self.effective_batch_size,
+            "samples_seen": self.samples_seen,
+            "target_samples_seen": self.target_samples_seen,
+            "warmup_optimizer_steps": self.warmup_optimizer_steps,
+            "checkpoint_every_optimizer_steps": self.checkpoint_every_optimizer_steps,
+            "sampling_cycle": cycle,
+            "sampling_cycle_sample_offset": cycle_offset,
+            "sampling_population_sha256": self.sampling_population_sha256,
             "rng_state": capture_rng_state(include_cuda=self.device.type == "cuda"),
-            "sampler": self.sampler.state_dict(),
+            "sampler": sampler_state,
             "shared_imc_scaler": self.train_dataset.scaler.to_dict(),
             "data_manifest_sha256": self.data_manifest_sha256,
             "checkpoint_selection": self.checkpoint_selection,
@@ -455,31 +513,46 @@ class V11Trainer:
             "grad_scaler_enabled": self.grad_scaler_enabled,
             "amp_calibration": self.amp_calibration,
             "wandb_run_id": self.wandb_run_id,
-            "history": self.history, "gradient_connectivity": self.gradient_connectivity,
+            "interval_history": self.history, "gradient_connectivity": self.gradient_connectivity,
+            "metric_logger_state": (
+                self.step_logger.state_dict() if self.step_logger is not None and hasattr(self.step_logger, "state_dict") else None
+            ),
         }
 
     def fit(
-        self, stop_before_epoch: int | None = None,
-        *, epoch_callback: Callable[[dict], None] | None = None,
+        self, stop_after_optimizer_step: int | None = None,
+        *, interval_callback: Callable[[dict], None] | None = None,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> list[dict]:
-        final_epoch = int(self.config["training"]["max_epochs"])
-        if stop_before_epoch is not None:
-            final_epoch = int(stop_before_epoch)
+        target = self.max_optimizer_steps if stop_after_optimizer_step is None else int(stop_after_optimizer_step)
+        if not self.global_step <= target <= self.max_optimizer_steps:
+            raise ValueError("stop_after_optimizer_step is outside remaining fixed budget")
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        for epoch in range(self.start_epoch, final_epoch):
+        while self.global_step < target:
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
             started = time.perf_counter()
-            global_step_before = self.global_step
+            step_start = self.global_step
+            samples_start = self.samples_seen
             skipped_before = self.skipped_optimizer_steps
-            self.sampler.set_epoch(epoch)
-            train = self._run_epoch(self.train_loader, True, epoch=epoch)
-            validation = None if self.validation_loader is None else self._run_epoch(self.validation_loader, False)
+            cycle_boundary = min(
+                ((self.global_step // self.checkpoint_every_optimizer_steps) + 1) * self.checkpoint_every_optimizer_steps,
+                self.max_optimizer_steps, target,
+            )
+            expected_steps = cycle_boundary - self.global_step
+            train, interrupted = self._run_segment(self._cycle_loader(), expected_steps, stop_requested)
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
+            elapsed_seconds = time.perf_counter() - started
             record = {
-                "epoch": epoch, "train": train, "validation": validation,
+                "sampling_cycle": step_start // self.checkpoint_every_optimizer_steps,
+                "step_start": step_start + 1, "step_end": self.global_step,
+                "samples_start": samples_start, "samples_end": self.samples_seen,
+                "checkpoint_reason": "interrupted" if interrupted else (
+                    "final" if self.global_step == self.max_optimizer_steps else "periodic"
+                ),
+                "train": train, "validation": None,
                 "train_loss": train["loss"],
                 **{
                     f"prediction_loss_h{horizon}": train[f"prediction_loss_h{horizon}"]
@@ -487,9 +560,12 @@ class V11Trainer:
                 },
                 "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
                 "global_step": self.global_step,
-                "optimizer_steps_this_epoch": self.global_step - global_step_before,
+                "optimizer_steps": self.global_step - step_start,
                 "skipped_amp_steps": self.skipped_optimizer_steps - skipped_before,
-                "elapsed_seconds": time.perf_counter() - started,
+                "elapsed_seconds": elapsed_seconds,
+                "samples_per_sec": (
+                    (self.samples_seen - samples_start) / elapsed_seconds if elapsed_seconds > 0 else 0.0
+                ),
                 "peak_vram_allocated": (
                     int(torch.cuda.max_memory_allocated()) if self.device.type == "cuda" else None
                 ),
@@ -498,17 +574,28 @@ class V11Trainer:
                 ),
             }
             self.history.append(record)
-            save_checkpoint(self._state(epoch), self.checkpoint_dir / "last.pt")
-            history_path = self.checkpoint_dir / "history.json"
+            # Commit the recovery checkpoint before publishing interval artifacts.
+            # If the process dies between these operations, resume state remains the
+            # authoritative prefix and local interval files are safely rewritten later.
+            save_checkpoint(self._state(), self.checkpoint_dir / "last.pt")
+            history_path = self.checkpoint_dir / "interval_history.json"
             history_temporary = history_path.with_suffix(".json.tmp")
             history_temporary.write_text(json.dumps(self.history, indent=2), encoding="utf-8")
             history_temporary.replace(history_path)
-            if epoch_callback is not None:
-                epoch_callback(deepcopy(record))
+            if interval_callback is not None:
+                interval_callback(deepcopy(record))
+            if interrupted:
+                self.interrupted = True
+                break
         return self.history
 
     def resume(self, state: dict) -> None:
         validate_v11_checkpoint(state)
+        if state.get("training_protocol_version") != FIXED_BUDGET_PROTOCOL:
+            raise ValueError(
+                "Cannot resume legacy epoch-budget checkpoint into training_protocol_version="
+                "fixed_sample_budget_v1. Legacy checkpoints remain evaluation-only."
+            )
         legacy_size = "DEBUG" if state["v11_config"].get("profile") == "debug" else self.model.model_size
         state_size = state.get("model_size", legacy_size)
         if state_size != self.model.model_size:
@@ -525,12 +612,33 @@ class V11Trainer:
         self.model.load_state_dict(state["model"], strict=True)
         self.optimizer.load_state_dict(state["optimizer"]); self.scheduler.load_state_dict(state["scheduler"])
         self.scaler.load_state_dict(state["scaler"]); restore_rng_state(state["rng_state"])
-        self.sampler.load_state_dict(state["sampler"])
-        self.global_step = int(state["global_step"]); self.start_epoch = int(state["epoch"]) + 1
-        self.history = list(state["history"]); self.skipped_optimizer_steps = int(state.get("skipped_optimizer_steps", 0))
+        for name, expected in (
+            ("max_optimizer_steps", self.max_optimizer_steps),
+            ("effective_batch_size", self.effective_batch_size),
+            ("target_samples_seen", self.target_samples_seen),
+            ("warmup_optimizer_steps", self.warmup_optimizer_steps),
+            ("checkpoint_every_optimizer_steps", self.checkpoint_every_optimizer_steps),
+            ("sampling_population_sha256", self.sampling_population_sha256),
+        ):
+            if state.get(name) != expected:
+                raise ValueError(f"cannot resume V1.1 with changed {name}")
+        self.global_step = int(state["global_step"])
+        self.samples_seen = int(state["samples_seen"])
+        if self.samples_seen != self.global_step * self.effective_batch_size:
+            raise ValueError("checkpoint samples_seen/global_step mismatch")
+        if self.global_step < self.max_optimizer_steps:
+            cycle, samples, offset = self._cycle_position()
+            expected_sampler = dict(state["sampler"])
+            if (expected_sampler.get("sampling_cycle"), expected_sampler.get("num_samples"), expected_sampler.get("start_offset")) != (cycle, samples, offset):
+                raise ValueError("checkpoint sampler position differs from committed samples")
+            self.sampler.load_state_dict(expected_sampler)
+        self.history = list(state["interval_history"])
+        self.skipped_optimizer_steps = int(state.get("skipped_optimizer_steps", 0))
         self.consecutive_amp_overflows = int(state.get("consecutive_amp_overflows", 0))
         self.daily_truncation_count = int(state["daily_truncation_count"])
         self.daily_truncated_tokens = int(state["daily_truncated_tokens"])
         self.gradient_connectivity = state.get("gradient_connectivity")
         self.amp_calibration = list(state.get("amp_calibration", [])); self.amp_calibrated = True
         self.wandb_run_id = state.get("wandb_run_id")
+        if self.step_logger is not None and hasattr(self.step_logger, "load_state_dict"):
+            self.step_logger.load_state_dict(state.get("metric_logger_state"))

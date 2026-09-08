@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import signal
 import subprocess
 import time
 from copy import deepcopy
@@ -20,7 +21,11 @@ from market_jepa.train.trainer import configure_determinism
 from .checkpoint import (
     load_v11_checkpoint, model_from_checkpoint, v11_implementation_manifest,
 )
-from .config import PROFILE_TRAINING, load_v11_config, model_size_from_config, validate_v11_config
+from .config import (
+    FIXED_BUDGET_PROTOCOL, FORMAL_CHECKPOINT_INTERVAL, FORMAL_MAX_OPTIMIZER_STEPS,
+    FORMAL_PROGRESS_INTERVAL, FORMAL_WARMUP_OPTIMIZER_STEPS, PROFILE_TRAINING,
+    load_v11_config, model_size_from_config, validate_v11_config,
+)
 from .dataset import V11ContractDataset, V11DataStore, fit_v11_shared_scaler
 from .development import (
     audit_contract_lineages, audit_full_production_bars,
@@ -28,16 +33,18 @@ from .development import (
 )
 from .model import MarketJEPAV11
 from .training import V11Trainer
+from .sampler import sampling_population_sha256
 from .wandb_logging import V11WandbLogger, read_persisted_run_id
 
 
 FORMAL_OUTPUT = Path("artifacts/training/v1_1_formal")
 FORMAL_DATA_ROOT = Path("/data/jepa/v1_1_raw")
 DEFAULT_FORMAL_SCALER_ANCHORS_PER_COMMODITY = 32
-EPOCH_FIELDS = (
-    "epoch", "train_loss", "prediction_loss_h16", "prediction_loss_h64",
-    "prediction_loss_h256", "learning_rate", "global_step",
-    "optimizer_steps_this_epoch", "skipped_amp_steps", "elapsed_seconds",
+INTERVAL_FIELDS = (
+    "sampling_cycle", "step_start", "step_end", "samples_start", "samples_end",
+    "checkpoint_reason", "train_loss", "prediction_loss_h16", "prediction_loss_h64",
+    "prediction_loss_h256", "learning_rate", "global_step", "optimizer_steps",
+    "skipped_amp_steps", "elapsed_seconds", "samples_per_sec",
     "peak_vram_allocated", "peak_vram_reserved",
 )
 
@@ -95,13 +102,18 @@ def validate_formal_training_config(config: dict[str, Any]) -> None:
     model_size = model_size_from_config(config["model"])
     profile_training = PROFILE_TRAINING[model_size]
     expected_training = {
+        "protocol_version": FIXED_BUDGET_PROTOCOL,
+        "budget_mode": "fixed_optimizer_steps",
+        "max_optimizer_steps": FORMAL_MAX_OPTIMIZER_STEPS,
+        "warmup_optimizer_steps": FORMAL_WARMUP_OPTIMIZER_STEPS,
+        "checkpoint_every_optimizer_steps": FORMAL_CHECKPOINT_INTERVAL,
+        "progress_every_optimizer_steps": FORMAL_PROGRESS_INTERVAL,
         "seed": 42,
         "optimizer": "AdamW",
         "learning_rate": 3e-4,
         "weight_decay": 0.05,
         "batch_size": profile_training["batch_size"],
         "gradient_accumulation": profile_training["gradient_accumulation"],
-        "warmup_ratio": 0.05,
         "scheduler": "cosine",
         "gradient_clip_norm": 1.0,
         "ema_tau": 0.996,
@@ -119,15 +131,80 @@ def validate_formal_training_config(config: dict[str, Any]) -> None:
         raise ValueError(f"formal V1.1 training configuration mismatch: {mismatches}")
 
 
-def _save_epoch_outputs(output: Path, history: list[dict]) -> None:
-    write_json(output / "history.json", history)
-    temporary = output / "epoch_metrics.csv.tmp"
+def _save_interval_outputs(output: Path, history: list[dict]) -> None:
+    write_json(output / "interval_history.json", history)
+    temporary = output / "interval_metrics.csv.tmp"
     with temporary.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=EPOCH_FIELDS)
+        writer = csv.DictWriter(handle, fieldnames=INTERVAL_FIELDS)
         writer.writeheader()
         for record in history:
-            writer.writerow({name: record.get(name) for name in EPOCH_FIELDS})
-    temporary.replace(output / "epoch_metrics.csv")
+            writer.writerow({name: record.get(name) for name in INTERVAL_FIELDS})
+    temporary.replace(output / "interval_metrics.csv")
+
+
+class FixedBudgetMetricLogger:
+    """Local source of truth first; W&B mirrors the exact 50-step aggregate."""
+    def __init__(self, output: Path, wandb: V11WandbLogger, interval: int) -> None:
+        self.path = output / "step_metrics.jsonl"
+        self.wandb = wandb
+        self.interval = int(interval)
+        self.buffer: list[dict[str, Any]] = []
+
+    def log_step(self, **value: Any) -> None:
+        self.buffer.append(dict(value))
+        if int(value["global_step"]) % self.interval:
+            return
+        values = self.buffer
+        seconds = sum(float(v["step_seconds"]) for v in values)
+        samples = sum(int(v["samples"]) for v in values)
+        grads = [float(v["grad_norm"]) for v in values if v["grad_norm"] is not None]
+        record = {
+            "global_step": int(values[-1]["global_step"]), "samples_seen": int(values[-1]["samples_seen"]),
+            "loss": sum(float(v["loss"]) for v in values) / len(values),
+            "h16_loss": sum(float(v["h16_loss"]) for v in values) / len(values),
+            "h64_loss": sum(float(v["h64_loss"]) for v in values) / len(values),
+            "h256_loss": sum(float(v["h256_loss"]) for v in values) / len(values),
+            "learning_rate": float(values[-1]["learning_rate"]),
+            "grad_norm": sum(grads) / len(grads) if grads else None,
+            "skipped_optimizer_steps": int(values[-1]["skipped_optimizer_steps"]),
+            "step_seconds": seconds / len(values),
+            "samples_per_sec": samples / seconds if seconds else 0.0,
+            "allocated_vram": max((int(v["allocated_vram_bytes"]) for v in values if v["allocated_vram_bytes"] is not None), default=None),
+            "reserved_vram": max((int(v["reserved_vram_bytes"]) for v in values if v["reserved_vram_bytes"] is not None), default=None),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, allow_nan=False) + "\n")
+            handle.flush()
+        payload = {"global_step": record["global_step"], "samples_seen": record["samples_seen"],
+                   "train/loss": record["loss"], "train/h16_loss": record["h16_loss"],
+                   "train/h64_loss": record["h64_loss"], "train/h256_loss": record["h256_loss"],
+                   "optim/learning_rate": record["learning_rate"],
+                   "optim/skipped_optimizer_steps": record["skipped_optimizer_steps"],
+                   "perf/step_seconds": record["step_seconds"], "perf/samples_per_sec": record["samples_per_sec"]}
+        if record["grad_norm"] is not None: payload["optim/grad_norm"] = record["grad_norm"]
+        if record["allocated_vram"] is not None: payload["perf/allocated_vram_gb"] = record["allocated_vram"] / 1024 ** 3
+        if record["reserved_vram"] is not None: payload["perf/reserved_vram_gb"] = record["reserved_vram"] / 1024 ** 3
+        self.wandb.log_metrics(payload)
+        self.buffer = []
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"interval": self.interval, "buffer": deepcopy(self.buffer)}
+
+    def load_state_dict(self, state: dict[str, Any] | None) -> None:
+        if state is None:
+            self.buffer = []
+            return
+        if int(state["interval"]) != self.interval:
+            raise ValueError("step metric interval changed on resume")
+        self.buffer = list(state["buffer"])
+
+    def reconcile(self, committed_step: int) -> None:
+        if not self.path.exists():
+            return
+        records = [json.loads(line) for line in self.path.read_text().splitlines() if line.strip()]
+        retained = [record for record in records if int(record["global_step"]) <= committed_step]
+        _atomic_text(self.path, "".join(json.dumps(record, allow_nan=False) + "\n" for record in retained))
 
 
 def _append_log(path: Path, message: str) -> None:
@@ -272,7 +349,7 @@ def _wandb_run_name(config: dict[str, Any], trainable_params: int) -> str:
     millions = trainable_params / 1_000_000
     return (
         f"v1.1-{size}-{millions:.2f}M-"
-        f"{int(config['training']['max_epochs'])}E-seed{int(config['training']['seed'])}"
+        f"{int(config['training']['max_optimizer_steps']) // 1000}Kstep-seed{int(config['training']['seed'])}"
     )
 
 
@@ -307,7 +384,13 @@ def _wandb_metadata(
         "batch_size": int(training["batch_size"]),
         "gradient_accumulation": int(training["gradient_accumulation"]),
         "effective_batch_size": int(training["batch_size"] * training["gradient_accumulation"]),
-        "max_epochs": int(training["max_epochs"]),
+        "training_protocol_version": training["protocol_version"],
+        "budget_mode": training["budget_mode"],
+        "max_optimizer_steps": int(training["max_optimizer_steps"]),
+        "target_samples_seen": int(training["max_optimizer_steps"] * training["batch_size"] * training["gradient_accumulation"]),
+        "warmup_optimizer_steps": int(training["warmup_optimizer_steps"]),
+        "checkpoint_every_optimizer_steps": int(training["checkpoint_every_optimizer_steps"]),
+        "sampling_population_sha256": protocol["sampling_population_sha256"],
         "seed": int(training["seed"]),
         "optimizer": training["optimizer"],
         "learning_rate": float(training["learning_rate"]),
@@ -337,7 +420,7 @@ def _wandb_tags(config: dict[str, Any], trainable_params: int) -> list[str]:
 
 def _final_summary_markdown(summary: dict[str, Any]) -> str:
     answers = summary["answers"]
-    lines = ["# Market-JEPA V1.1 formal training", "", f"Status: `{summary['status']}`", ""]
+    lines = ["# Market-JEPA V1.1 fixed-sample-budget training", "", f"Status: `{summary['status']}`", ""]
     lines.extend(f"{index}. {answer}" for index, answer in enumerate(answers, 1))
     lines.extend(("", f"Held-out {summary['held_out_commodity']} evaluation was not run.", ""))
     return "\n".join(lines)
@@ -345,14 +428,14 @@ def _final_summary_markdown(summary: dict[str, Any]) -> str:
 
 def write_failure_summary(output: Path, error: BaseException) -> None:
     summary = {
-        "status": "V1_1_FORMAL_TRAINING_FAIL",
+        "status": "V1_1_FIXED_SAMPLE_BUDGET_TRAINING_FAIL",
         "error": f"{type(error).__name__}: {error}",
     }
     write_json(output / "final_summary.json", summary)
     _atomic_text(
         output / "final_summary.md",
-        "# Market-JEPA V1.1 formal training\n\n"
-        "Status: `V1_1_FORMAL_TRAINING_FAIL`\n\n"
+        "# Market-JEPA V1.1 fixed-sample-budget training\n\n"
+        "Status: `V1_1_FIXED_SAMPLE_BUDGET_TRAINING_FAIL`\n\n"
         f"Error: `{summary['error']}`\n",
     )
     _append_log(output / "training.log", f"training failed error={summary['error']}")
@@ -370,11 +453,24 @@ def run_formal_training(
     log_path = output / "training.log"
     config = _formal_config(config_path, output)
     model_size = model_size_from_config(config["model"])
-    max_epochs = int(config["training"]["max_epochs"])
-    final_epoch = max_epochs - 1
+    max_optimizer_steps = int(config["training"]["max_optimizer_steps"])
+    effective_batch_size = int(config["training"]["batch_size"] * config["training"]["gradient_accumulation"])
+    target_samples_seen = max_optimizer_steps * effective_batch_size
     checkpoint_path = Path(config["training"]["checkpoint_dir"]) / "last.pt"
     if resume is None and checkpoint_path.exists():
         raise FileExistsError(f"formal checkpoint already exists; use --resume {checkpoint_path}")
+    if resume is None and not checkpoint_path.exists():
+        stale_progress = [
+            path for path in (
+                output / "step_metrics.jsonl", output / "interval_history.json",
+                output / "interval_metrics.csv", output / "wandb_run.json",
+            ) if path.exists()
+        ]
+        if stale_progress:
+            raise FileExistsError(
+                "fixed-budget progress artifacts exist without a recovery checkpoint; "
+                f"use a fresh output directory or remove the stale artifacts: {stale_progress}"
+            )
     if resume is not None and not Path(resume).is_file():
         raise FileNotFoundError(resume)
     if not torch.cuda.is_available():
@@ -546,6 +642,7 @@ def run_formal_training(
         for commodity in train_commodities
     }
     counts = parameter_counts(config)
+    population_sha256 = sampling_population_sha256(train_dataset, data_manifest_sha256)
     write_json(output / "parameter_counts.json", counts)
     protocol = {
         "design_version": "1.1",
@@ -571,12 +668,19 @@ def run_formal_training(
         "valid_anchors": anchors_by_commodity,
         "total_train_anchors": len(train_dataset),
         "sampler": "Commodity -> Eligible Contract -> Anchor",
-        "samples_per_epoch": len(train_dataset),
+        "training_protocol_version": FIXED_BUDGET_PROTOCOL,
+        "budget_mode": "fixed_optimizer_steps",
+        "max_optimizer_steps": max_optimizer_steps,
+        "effective_batch_size": effective_batch_size,
+        "target_samples_seen": target_samples_seen,
+        "warmup_optimizer_steps": config["training"]["warmup_optimizer_steps"],
+        "checkpoint_every_optimizer_steps": config["training"]["checkpoint_every_optimizer_steps"],
+        "sampling_population_sha256": population_sha256,
+        "dataset_equivalent_exposure_ratio": target_samples_seen / len(train_dataset),
         "batch_size": config["training"]["batch_size"],
         "gradient_accumulation": config["training"]["gradient_accumulation"],
         "amp": config["training"]["amp"],
         "amp_dtype": config["training"].get("amp_dtype", "float16"),
-        "epochs": config["training"]["max_epochs"],
         "seed": config["training"]["seed"],
         "num_workers": config["training"]["num_workers"],
         "shared_scaler_fitting_population": list(train_commodities),
@@ -585,7 +689,7 @@ def run_formal_training(
         "scaler_total_selected_anchors": sum(scaler_selection.values()),
         "scaler_source_valid_counts": shared_scaler.source_counts,
         "checkpoint_policy": "fixed_budget_final",
-        "official_endpoint": f"epoch {final_epoch} last.pt",
+        "official_endpoint": f"global_step={max_optimizer_steps} last.pt",
         "HELD_OUT_READ_DURING_TRAINING": False,
         "RB_READ_DURING_TRAINING": False if held_out_commodity == "RB" else None,
         "wandb": {
@@ -601,7 +705,9 @@ def run_formal_training(
     checkpoint_policy = {
         "selection": "fixed_budget_final",
         "official_checkpoint": str(checkpoint_path),
-        "official_epoch": final_epoch,
+        "official_global_step": max_optimizer_steps,
+        "target_samples_seen": target_samples_seen,
+        "checkpoint_every_optimizer_steps": config["training"]["checkpoint_every_optimizer_steps"],
         "validation_dataset": False,
         "validation_can_select_checkpoint": False,
         "early_stopping": False,
@@ -619,17 +725,21 @@ def run_formal_training(
         warning=lambda message: _append_log(log_path, f"WARNING {message}"),
         info=lambda message: _append_log(log_path, message),
     )
+    metric_logger = FixedBudgetMetricLogger(
+        output, wandb_logger, int(config["logging"]["wandb"]["log_every_optimizer_steps"]),
+    )
     trainer = V11Trainer(
         model, config, train_dataset, torch.device("cuda"),
-        validation_dataset=None, samples_per_epoch=len(train_dataset),
-        data_manifest_sha256=data_manifest_sha256, step_logger=wandb_logger,
+        validation_dataset=None, data_manifest_sha256=data_manifest_sha256,
+        sampling_population_digest=population_sha256, step_logger=metric_logger,
     )
     resumed = resume is not None
     resume_state = None
     if resumed:
         resume_state = load_v11_checkpoint(Path(resume))
         trainer.resume(resume_state)
-        _append_log(log_path, f"resume accepted: {resume}; start_epoch={trainer.start_epoch}")
+        metric_logger.reconcile(trainer.global_step)
+        _append_log(log_path, f"resume accepted: {resume}; global_step={trainer.global_step}")
 
     resume_run_id = (
         resume_state.get("wandb_run_id") if resume_state is not None else None
@@ -645,33 +755,54 @@ def run_formal_training(
     if run_id:
         trainer.wandb_run_id = run_id
 
-    def epoch_complete(record: dict) -> None:
+    def interval_complete(record: dict) -> None:
         # Local files are the source of truth and are committed before W&B mirrors them.
-        _save_epoch_outputs(output, trainer.history)
+        _save_interval_outputs(output, trainer.history)
         _append_log(
             log_path,
-            "epoch={epoch} train_loss={train_loss:.8f} h16={prediction_loss_h16:.8f} "
+            "step_start={step_start} step_end={step_end} reason={checkpoint_reason} "
+            "train_loss={train_loss:.8f} h16={prediction_loss_h16:.8f} "
             "h64={prediction_loss_h64:.8f} h256={prediction_loss_h256:.8f} "
             "global_step={global_step} elapsed_seconds={elapsed_seconds:.3f}".format(**record),
         )
-        wandb_logger.log_epoch(record, samples_per_epoch=len(train_dataset))
 
     torch.cuda.reset_peak_memory_stats()
     invocation_started = time.perf_counter()
+    stop = {"requested": False, "signal": None, "logged": False}
+    previous_handlers = {}
+    def request_stop(signum, _frame):
+        # Python signal handlers should do the minimum possible work. File I/O is
+        # deferred until the trainer reaches the next committed optimizer update.
+        stop["requested"] = True
+        stop["signal"] = int(signum)
+    def stop_requested() -> bool:
+        if stop["requested"] and not stop["logged"]:
+            _append_log(
+                log_path,
+                f"signal={stop['signal']} received; checkpoint after current optimizer update",
+            )
+            stop["logged"] = True
+        return bool(stop["requested"])
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, request_stop)
     try:
-        history = trainer.fit(epoch_callback=epoch_complete)
+        history = trainer.fit(interval_callback=interval_complete, stop_requested=stop_requested)
     except BaseException as error:
         wandb_logger.fail(error)
         raise
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
     torch.cuda.synchronize()
     invocation_elapsed = time.perf_counter() - invocation_started
-    _save_epoch_outputs(output, history)
+    _save_interval_outputs(output, history)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
     state = load_v11_checkpoint(checkpoint_path)
     restored = model_from_checkpoint(state)
     del restored
-    checkpoint_roundtrip = state["history"] == history
+    checkpoint_roundtrip = state["interval_history"] == history
     checkpoint_sha256 = sha256(checkpoint_path)
 
     finite_metrics = all(
@@ -685,12 +816,13 @@ def run_formal_training(
         and not state["gradient_connectivity"]["nonfinite"]
     )
     completed = (
-        len(history) == max_epochs and history[-1]["epoch"] == final_epoch
-        and int(state["epoch"]) == final_epoch and finite_metrics and gradient_ok
+        int(state["global_step"]) == max_optimizer_steps
+        and int(state["samples_seen"]) == target_samples_seen and finite_metrics and gradient_ok
         and state["checkpoint_selection"] == "fixed_budget_final"
         and state["data_manifest_sha256"] == data_manifest_sha256
         and state["v11_implementation_sha256"] == implementation_sha256
         and state["shared_imc_scaler"] == shared_scaler.to_dict()
+        and state["sampling_population_sha256"] == population_sha256
         and checkpoint_roundtrip
     )
     peak_allocated = max(int(record["peak_vram_allocated"] or 0) for record in history)
@@ -703,14 +835,14 @@ def run_formal_training(
         "cuda_build": torch.version.cuda,
         "peak_vram_allocated": peak_allocated,
         "peak_vram_reserved": peak_reserved,
-        "total_epoch_elapsed_seconds": total_elapsed,
+        "total_interval_elapsed_seconds": total_elapsed,
         "this_invocation_elapsed_seconds": invocation_elapsed,
     }
     write_json(output / "resource_usage.json", resource_usage)
     answers = [
-        f"All {max_epochs} epochs complete: {'YES' if len(history) == max_epochs else 'NO'}.",
-        f"Final checkpoint is epoch{final_epoch} last.pt: "
-        f"{'YES' if state['epoch'] == final_epoch else 'NO'}.",
+        f"All {max_optimizer_steps} optimizer steps complete: {'YES' if completed else 'NO'}.",
+        f"Final checkpoint is global_step={max_optimizer_steps} last.pt: "
+        f"{'YES' if state['global_step'] == max_optimizer_steps else 'NO'}.",
         f"Resume occurred: {'YES' if resumed else 'NO'}.",
         f"Final global_step: {state['global_step']}.",
         f"Train commodities: {list(train_commodities)}.",
@@ -728,15 +860,19 @@ def run_formal_training(
         f"All intended trainable parameters have finite gradients: {'YES' if gradient_ok else 'NO'}.",
         f"Daily truncation count: {state['daily_truncation_count']}.",
         f"Peak VRAM allocated/reserved: {peak_allocated}/{peak_reserved} bytes.",
-        f"Total epoch elapsed time: {total_elapsed} seconds.",
+        f"Samples seen/target: {state['samples_seen']}/{target_samples_seen}.",
+        f"Total interval elapsed time: {total_elapsed} seconds.",
         f"Checkpoint SHA256: {checkpoint_sha256}.",
         f"Data manifest SHA256: {data_manifest_sha256}.",
         f"Implementation SHA256: {implementation_sha256}.",
     ]
     summary = {
-        "status": "V1_1_FORMAL_TRAINING_PASS" if completed else "V1_1_FORMAL_TRAINING_FAIL",
-        "final_epoch": int(state["epoch"]),
+        "status": ("V1_1_FIXED_SAMPLE_BUDGET_TRAINING_PASS" if completed else
+                   "INTERRUPTED_RECOVERY_CHECKPOINT_SAVED" if trainer.interrupted else
+                   "V1_1_FIXED_SAMPLE_BUDGET_TRAINING_FAIL"),
         "global_step": int(state["global_step"]),
+        "samples_seen": int(state["samples_seen"]),
+        "target_samples_seen": target_samples_seen,
         "resumed": resumed,
         "total_elapsed_seconds": total_elapsed,
         "final_metrics": {name: final[name] for name in (
@@ -756,6 +892,8 @@ def run_formal_training(
         "checkpoint_sha256": checkpoint_sha256,
         "data_manifest_sha256": data_manifest_sha256,
         "implementation_sha256": implementation_sha256,
+        "sampling_population_sha256": population_sha256,
+        "stop_signal": stop["signal"],
         "answers": answers,
     }
     write_json(output / "final_summary.json", summary)
@@ -763,8 +901,8 @@ def run_formal_training(
     _append_log(log_path, f"training finished status={summary['status']}")
     wandb_logger.finish({
         "status": summary["status"],
-        "final_epoch": summary["final_epoch"],
         "final_global_step": summary["global_step"],
+        "samples_seen": summary["samples_seen"],
         "final_loss": final["train_loss"],
         "final_h16_loss": final["prediction_loss_h16"],
         "final_h64_loss": final["prediction_loss_h64"],
