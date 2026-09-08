@@ -46,16 +46,18 @@ def train_control(reference, variant, output, resume=None):
     count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if variant == "LateFusion" and abs(count / state["trainable_parameter_count"] - 1) > .05:
         raise ValueError("LateFusion parameter match exceeds 5%")
-    trainer = ControlTrainer(model, config, dataset, torch.device("cuda"),
+    protocol = {
+        "variant": variant, "reference_checkpoint_sha256": file_hash(reference), "config": config,
+        "reference_sampler_num_samples": state["sampler"]["num_samples"],
+        "trainable_params": count, "scaler_sha256": scaler.checksum,
+        "from_scratch": True, "checkpoint_policy": "fixed_budget_final",
+        "data_manifest_sha256": state["data_manifest_sha256"], "RB_read": False,
+    }
+    trainer = ControlTrainer(model, config, dataset, torch.device("cuda"), control_protocol=protocol,
                              data_manifest_sha256=state["data_manifest_sha256"])
     if resume is not None:
         trainer.resume(load_v11_checkpoint(resume))
-    write_json(output / "control_protocol.json", {
-        "variant": variant, "reference_sha256": file_hash(reference), "config": config,
-        "trainable_params": count, "scaler_sha256": scaler.checksum,
-        "from_scratch": resume is None, "checkpoint_policy": "fixed_budget_final",
-        "data_manifest_sha256": state["data_manifest_sha256"], "RB_read": False,
-    })
+    write_json(output / "control_protocol.json", protocol)
     trainer.fit(epoch_callback=lambda _: _save_epoch_outputs(output, trainer.history))
     endpoint = output / "checkpoints" / "last.pt"
     restored = load_v11_checkpoint(endpoint)

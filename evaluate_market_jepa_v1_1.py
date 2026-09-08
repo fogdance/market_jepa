@@ -33,6 +33,7 @@ def main():
     frozen.add_argument("--checkpoints", nargs="+", required=True)
     frozen.add_argument("--evaluations", nargs="+", required=True)
     frozen.add_argument("--manifest", required=True); frozen.add_argument("--output", required=True)
+    frozen.add_argument("--campaign-plan", required=True)
     for name in ("rb-dev", "rb-test"):
         rb = commands.add_parser(name)
         rb.add_argument("--freeze", required=True); rb.add_argument("--output", required=True)
@@ -51,7 +52,7 @@ def main():
     elif args.command == "compare":
         compare_runs(args.runs, args.output, args.rb_runs)
     elif args.command == "freeze-rb":
-        freeze(args.checkpoints, args.evaluations, args.manifest, args.output)
+        freeze(args.checkpoints, args.evaluations, args.manifest, args.output, plan_path=args.campaign_plan)
     else:
         run_heldout(args.freeze, args.output, partition=args.command.replace("-", "_"),
                     approval=args.approval, device=args.device, batch_size=args.batch_size)

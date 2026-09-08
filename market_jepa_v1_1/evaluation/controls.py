@@ -11,6 +11,7 @@ from market_jepa_v1_1.model import MarketJEPAV11
 from market_jepa_v1_1.training import V11Trainer
 
 from .structure import remove_sources
+from .protocol import control_semantic_hashes, digest
 
 
 class LateFusionControl(MarketJEPAV11):
@@ -51,10 +52,13 @@ class LateFusionControl(MarketJEPAV11):
             state, _, _ = encoder(batch[source + "_market"], batch[source + "_context"], mask,
                                    batch[source + "_imc_validity"], boundary)
             compressed.append(state.mean(1))
-        minute = self.minute_local(batch["minute_market"], batch["minute_context"],
-                                   batch["minute_mask"], batch["minute_imc_validity"])
-        valid = (~batch["minute_mask"]).unsqueeze(-1)
-        minute_vector = (minute * valid).sum(1) / valid.sum(1).clamp_min(1)
+        context = batch["minute_context"].masked_fill(batch["minute_mask"].unsqueeze(-1), 0)
+        if not torch.isfinite(context).all():
+            raise ValueError("valid minute context contains NaN/Inf")
+        encoded, _ = self.minute_local.market_core.encode_tokens(
+            batch["minute_market"], batch["minute_imc_validity"], batch["minute_mask"],
+            additive_context=self.minute_local.context_projection(context))
+        minute, minute_vector = encoded[:, 1:], encoded[:, 0]
         belief = self.fusion(torch.cat([minute_vector, *compressed], -1))
         result = {"z_market": belief, "predictions": {h: self.predictors[str(h)](belief) for h in self.horizons}}
         if "target_minute_market" in batch and batch["target_minute_market"] is not None:
@@ -63,7 +67,7 @@ class LateFusionControl(MarketJEPAV11):
                     batch["target_minute_imc_validity"][h], batch["target_minute_mask"][h]) for h in self.horizons}
         if return_intermediates:
             result["intermediates"] = {"minute_local_tokens": minute, "scale_vectors": compressed,
-                                       "final_belief": belief}
+                                       "minute_vector": minute_vector, "final_belief": belief}
         return result
 
 
@@ -93,12 +97,29 @@ def control_model(config, variant, *, debug=False):
 
 
 class ControlTrainer(V11Trainer):
+    def __init__(self, *args, control_protocol, **kwargs):
+        self.control_protocol = deepcopy(control_protocol)
+        self.control_provenance = {
+            "reference_checkpoint_sha256": control_protocol["reference_checkpoint_sha256"],
+            "reference_sampler_num_samples": control_protocol["reference_sampler_num_samples"],
+            "control_protocol_sha256": digest(control_protocol),
+        }
+        self.control_semantics = control_semantic_hashes()
+        super().__init__(*args, **kwargs)
+
     def _state(self, epoch):
+        if self.control_semantics != control_semantic_hashes():
+            raise ValueError("control implementation changed during training")
         state = super()._state(epoch)
         state["evaluation_variant"] = self.model.evaluation_variant
+        state["control_protocol"] = self.control_protocol
+        state["control_provenance"] = self.control_provenance
+        state["control_semantic_hashes"] = self.control_semantics
         return state
 
     def resume(self, state):
+        if state.get("control_provenance") != self.control_provenance or state.get("control_semantic_hashes") != self.control_semantics:
+            raise ValueError("control provenance/semantic mismatch")
         if state.get("evaluation_variant") != self.model.evaluation_variant:
             raise ValueError("control checkpoint variant mismatch")
         super().resume(state)

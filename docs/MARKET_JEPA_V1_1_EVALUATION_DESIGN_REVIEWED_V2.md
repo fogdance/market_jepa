@@ -1,6 +1,8 @@
 # Market-JEPA V1.1 正式评估设计与 Review 规范
 
-**状态：DRAFT FOR REVIEW**  
+**状态：REVIEWED — implementation review corrections frozen**
+
+后续代码评审修订优先于下文原始描述：A1 persistence 按 H16/H64/H256 分别读取过去 H 根；LateFusion Minute 使用 learned CLS；control 绑定 Full S checkpoint、sampler 和自身代码 hash。H16 severe regression 定义为 paired 95% CI upper < 0。History PASS 必须同时无 aggregate 显著负 transfer；MinuteOnly 的 RB 不显著更差也采用 CI upper < 0 判定。Scaling pair benefit 与完整 S→M→L→XL 序列 claim 分开。RB 必须通过 canonical campaign plan 的完整 cohort 校验及唯一 consumption ledger。具体操作见实施文档。
 **用途：在交给 Codex 实现之前冻结评估目标、对照实验、统计方法、PASS/FAIL 解释边界。**
 
 ## 0. 核心目标
@@ -162,12 +164,12 @@ Minute | (C,K) -> M'
 
 因此必须分两层：
 
-PART A — V0-Compatible Evaluation  
+PART A — V0-Compatible Evaluation
 PART B — V1.1-Specific Evaluation
 
 再加：
 
-PART C — Capacity Scaling  
+PART C — Capacity Scaling
 PART D — Claim Boundary
 
 ---
@@ -1431,9 +1433,9 @@ Core Goal
 4. scaling 只有在 RB 同时改善时才有强意义。
 5. 明确 Predictive Belief 与 Predictive State 的理论边界。
 
-**当前状态：DRAFT FOR REVIEW。**
+**当前状态：REVIEWED，数值决策与代码评审修订已冻结。**
 
-在第 16 节的 9 个参数拍板前，不建议直接交给 Codex 实现。
+实际冻结值与 V0 outcome override 见实施文档；正式 RB-Test 仍需独立人工批准。
 
 
 ---
@@ -1605,14 +1607,7 @@ min(4096, available_valid_anchors)
 - Anchor budgets 明确为上限，不做 replacement；
 - source-ablation claim boundary 进一步收紧。
 
-### 仍需人工拍板
+### 后续冻结状态
 
-- 第 16 节九项具体数值/阈值。
-
-在这些项目冻结后，状态可以从：
-
-`DRAFT FOR REVIEW`
-
-升级为：
-
-`APPROVED FOR CODEX IMPLEMENTATION`
+用户已确认实现默认数值、V0 outcome parity override 及后续代码评审修订。
+状态为 `APPROVED FOR CODEX IMPLEMENTATION`，不代表批准执行 RB-Test。

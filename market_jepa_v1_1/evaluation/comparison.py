@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from .metrics import bootstrap
-from .protocol import write_json
+from .protocol import write_json, matched_control_gate
 from .runner import write_csv
 
 
@@ -31,27 +31,27 @@ def comparison_status(variant, gain, skill, rb_gain, rb_skill):
     overall = gain["all"]["point"] > 0 and skill["all"]["point"] > 0
     long = any(gain[h]["ci95_low"] > 0 or skill[h]["ci95_low"] > 0 for h in ("64", "256"))
     if variant == "LateFusion":
-        if not overall or rb_skill["all"]["ci95_high"] < 0:
+        if (not overall or rb_skill["all"]["ci95_high"] < 0
+                or any(metric["16"]["ci95_high"] < 0 for metric in (gain, skill))):
             return "FAIL"
         if not long:
             return "PARTIAL"
-        # The reviewed text explicitly requires an H16 severe-regression gate,
-        # but specifies no quantitative definition. Never silently invent one.
-        if gain["16"]["point"] >= 0 and skill["16"]["point"] >= 0:
-            return "V1_1_ARCHITECTURE_PASS"
-        return "BLOCKED_H16_SEVERE_REGRESSION_THRESHOLD_UNDEFINED"
+        return "V1_1_ARCHITECTURE_PASS"
     if variant == "MinuteOnly":
-        return "V1_1_MULTISCALE_PASS" if overall and long and rb_skill["all"]["point"] >= 0 else "NOT_PASS"
+        return "V1_1_MULTISCALE_PASS" if overall and long and rb_skill["all"]["ci95_high"] >= 0 else "NOT_PASS"
     if variant == "NoHistoricalWeekly":
         evidence = long or rb_skill["all"]["ci95_low"] > 0 or rb_gain["all"]["ci95_low"] > 0
-        return "V1_1_HISTORY_PASS" if evidence else "NOT_PASS"
+        negative_transfer = any(metric["all"]["ci95_high"] < 0 for metric in (gain, skill, rb_gain, rb_skill))
+        return "V1_1_HISTORY_PASS" if evidence and not negative_transfer else "NOT_PASS"
     rb_improves = rb_gain["all"]["point"] > 0 and rb_skill["all"]["point"] > 0
     if overall and rb_improves:
-        return "V1_1_SCALING_SUPPORTED"
+        return "CAPACITY_BENEFIT_VS_S"
     return "memorization / in-domain scaling" if overall else "SCALING_NOT_SUPPORTED"
 
 
 def compare_runs(directories, output, rb_directories=None):
+    if not directories:
+        raise ValueError("comparison requires evaluation runs")
     runs = []
     for directory in directories:
         p = Path(directory)
@@ -62,6 +62,8 @@ def compare_runs(directories, output, rb_directories=None):
             errors = {key: values[key] for key in values.files}
         runs.append((p, summary, protocol, records, errors))
     reference = runs[0]
+    if reference[2]["variant"] != "Full" or reference[2]["model_size"] != "S":
+        raise ValueError("comparison reference must be Full S")
     rows, comparisons = [], []
     for run in runs:
         p, summary, protocol, records, errors = run
@@ -110,6 +112,7 @@ def compare_runs(directories, output, rb_directories=None):
             rb_gain = paired_improvement(rb[1][1]["jepa"], rb[1][1]["persistence"], rb[0][1]["jepa"], rb[0][1]["persistence"], rb[0][0])
             rb_skill = paired_improvement(rb[1][1]["belief_error"], rb[1][1]["summary_error"], rb[0][1]["belief_error"], rb[0][1]["summary_error"], rb[0][0])
         if protocol["variant"] != "Full":
+            matched_control_gate(protocol, reference[2])
             if reference[2]["variant"] != "Full" or reference[2]["model_size"] != "S" or protocol["model_size"] != "S":
                 raise ValueError("controls must compare to Full S")
             if protocol["variant"] == "LateFusion" and abs(protocol["trainable_params"] / reference[2]["trainable_params"] - 1) > .05:
@@ -125,13 +128,49 @@ def compare_runs(directories, output, rb_directories=None):
         comparisons.append({"run": str(p), "relative_to": str(reference[0]), "delta_gain": a1, "delta_skill": a2,
                             "delta_rb_gain": rb_gain, "delta_rb_skill": rb_skill,
                             "direction": "Full-Control" if protocol["variant"] != "Full" else "larger-smaller",
-                            "formal_status": comparison_status(protocol["variant"], a1, a2, rb_gain, rb_skill)})
+                            "formal_status": comparison_status(protocol["variant"], a1, a2, rb_gain, rb_skill),
+                            "warnings": ["H16 negative point, uncertain (CI includes zero)"] if any(
+                                metric["16"]["point"] < 0 <= metric["16"]["ci95_high"] for metric in (a1, a2)) else []})
+    adjacent = []
+    full_indices = sorted([i for i, r in enumerate(runs) if r[2]["variant"] == "Full"],
+                          key=lambda i: runs[i][2]["trainable_params"])
+    for small, large in zip(full_indices, full_indices[1:]):
+        left, right = runs[large], runs[small]
+        rec = left[3]
+        test_records = [r for r, flag in zip(rec, left[4]["test_mask"]) if flag]
+        gain = paired_improvement(left[4]["jepa"], left[4]["persistence"], right[4]["jepa"], right[4]["persistence"], rec)
+        skill = paired_improvement(left[4]["belief_error"], left[4]["summary_error"], right[4]["belief_error"], right[4]["summary_error"], test_records)
+        rb_gain = rb_skill = None
+        if rb_directories is not None:
+            rb = []
+            for i in (large, small):
+                directory = Path(rb_directories[i])
+                with np.load(directory / "paired_errors.npz", allow_pickle=False) as data:
+                    rb.append(dict(data))
+            rec = json.loads((Path(rb_directories[large]) / "paired_records.json").read_text())
+            rb_gain = paired_improvement(rb[0]["jepa"], rb[0]["persistence"], rb[1]["jepa"], rb[1]["persistence"], rec)
+            rb_skill = paired_improvement(rb[0]["belief_error"], rb[0]["summary_error"], rb[1]["belief_error"], rb[1]["summary_error"], rec)
+        adjacent.append({"from": right[2]["model_size"], "to": left[2]["model_size"],
+                         "delta_gain": gain, "delta_skill": skill, "delta_rb_gain": rb_gain, "delta_rb_skill": rb_skill})
     result = {"rows": rows, "paired_comparisons": comparisons,
-              "scaling_status": "SEE_PAIRED_COMPARISONS" if rb_directories else "NOT_EVALUATED_RB_REQUIRED",
+              "adjacent_pairs": adjacent,
+              "scaling_status": scaling_sequence_status([runs[i][2]["model_size"] for i in full_indices], adjacent),
               "rb_test_consumed": rb_directories is not None,
-              "architecture_gate_blocker": "Reviewed V2 does not quantify H16 severe regression; no invented threshold"}
+              "h16_severe_regression": "paired 95% CI upper < 0"}
     output = Path(output); output.mkdir(parents=True, exist_ok=True)
     write_csv(output / "scaling_summary.csv", rows)
     write_json(output / "scaling_summary.json", result)
     (output / "scaling_report.md").write_text(json.dumps(result, indent=2) + "\n")
     return result
+
+
+def scaling_sequence_status(sizes, adjacent):
+    if sizes != ["S", "M", "L", "XL"] or len(adjacent) != 3:
+        return "INCOMPLETE_SCALING_COHORT"
+    if any(p["delta_rb_gain"] is None or p["delta_rb_skill"] is None for p in adjacent):
+        return "NOT_EVALUATED_RB_REQUIRED"
+    train_up = all(p[k]["all"]["point"] > 0 for p in adjacent for k in ("delta_gain", "delta_skill"))
+    rb_up = all(p[k]["all"]["point"] > 0 for p in adjacent for k in ("delta_rb_gain", "delta_rb_skill"))
+    if train_up and rb_up:
+        return "V1_1_SCALING_SUPPORTED"
+    return "IN_DOMAIN_CAPACITY_SCALING_ONLY" if train_up else "SCALING_MIXED"

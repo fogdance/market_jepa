@@ -12,7 +12,9 @@ SOURCES = ("minute", "daily", "current_weekly", "history_weekly")
 WINDOWS = ((16, 64, 256, 512), (5, 20, 60, 256), (4, 13, 26, 64), (13, 52, 104, 156))
 ALPHAS = (1e-4, 1e-3, 1e-2, 1e-1, 1., 10., 100.)
 PROTOCOL = {
-    "version": "reviewed_v2_v0_outcome_override", "seed": 42,
+    "version": "reviewed_v2_review_corrections_1", "seed": 42,
+    "persistence": "horizon-specific past H bars; online same-origin IMC; PAD/MASK retained",
+    "severe_regression": "paired 95% CI upper < 0",
     "probe_split": [0.70, 0.15, 0.15], "rb_dev_fraction": 1 / 3,
     "train_probe_anchors_per_commodity": 4096, "rb_dev_anchors": 32768,
     "rb_test_anchors": 65536, "structure_audit_anchors": 16384,
@@ -59,6 +61,10 @@ def completed_run_gate(checkpoint, state):
         audit = json.loads((run / "data_audit.json").read_text())
         if audit.get("status") != "PASS" or audit.get("held_out_bar_files_opened") is not False:
             raise ValueError("training data audit or held-out isolation failed")
+    else:
+        protocol = json.loads((run / "control_protocol.json").read_text())
+        if protocol != state.get("control_protocol"):
+            raise ValueError("control protocol file/checkpoint mismatch")
     return {"summary_sha256": file_hash(summary_path), "status": "PASS"}
 
 
@@ -227,3 +233,30 @@ def semantic_implementation_gate(state):
         expected = state["v11_implementation_manifest"]["files"].get(relative)
         if expected != file_hash(root / relative):
             raise ValueError(f"checkpoint semantic implementation mismatch: {relative}")
+    if state.get("evaluation_variant", "Full") != "Full":
+        if state.get("control_semantic_hashes") != control_semantic_hashes():
+            raise ValueError("control semantic implementation mismatch")
+        protocol = state.get("control_protocol", {})
+        provenance = state.get("control_provenance", {})
+        if (not protocol or provenance.get("control_protocol_sha256") != digest(protocol)
+                or protocol.get("variant") != state["evaluation_variant"]
+                or protocol.get("from_scratch") is not True
+                or provenance.get("reference_sampler_num_samples") != state["sampler"]["num_samples"]
+                or any(provenance.get(k) != protocol.get(k) for k in
+                       ("reference_checkpoint_sha256", "reference_sampler_num_samples"))):
+            raise ValueError("control provenance mismatch")
+
+
+def control_semantic_hashes():
+    root = Path(__file__).resolve().parents[2]
+    return {name: file_hash(root / name) for name in (
+        "market_jepa_v1_1/evaluation/controls.py", "market_jepa_v1_1/evaluation/structure.py")}
+
+
+def matched_control_gate(control, reference):
+    provenance = control.get("control_provenance", {})
+    if (not provenance.get("control_protocol_sha256")
+            or provenance.get("reference_checkpoint_sha256") != reference["checkpoint_sha256"]
+            or provenance.get("reference_sampler_num_samples") != reference["sampler_num_samples"]
+            or control["sampler_num_samples"] != reference["sampler_num_samples"]):
+        raise ValueError("matched control reference checkpoint/sampler mismatch")

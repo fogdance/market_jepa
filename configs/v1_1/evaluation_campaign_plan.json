@@ -1,0 +1,12 @@
+{
+  "campaign_id": "v1_1_formal_campaign",
+  "expected_models": [
+    {"model_size": "S", "variant": "Full"},
+    {"model_size": "M", "variant": "Full"},
+    {"model_size": "L", "variant": "Full"},
+    {"model_size": "XL", "variant": "Full"},
+    {"model_size": "S", "variant": "LateFusion"},
+    {"model_size": "S", "variant": "MinuteOnly"},
+    {"model_size": "S", "variant": "NoHistoricalWeekly"}
+  ]
+}

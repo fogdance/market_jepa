@@ -45,8 +45,10 @@ and evaluation code hashes. Every size/control must use the same manifest.
 Only final fixed-budget checkpoints are accepted. Checkpoints are read without
 changing training or optimizer state; models and EMA are frozen for evaluation.
 
-A1 encodes the current market-only observation with the checkpoint's EMA core
-for persistence. Each prediction and persistence is compared to its own model's
+A1 encodes the last H market-only observation bars separately for H16/H64/H256
+with the checkpoint's EMA core for persistence (exact V0 window semantics).
+Slicing retains the online IMC origin and contract-local left PAD/MASK.
+Each prediction and persistence is compared to its own model's
 clean same-origin future EMA target. Gain is a ratio of mean cosine errors, not
 the average of per-anchor ratios. Cross-size absolute latent-loss ranking is
 not implemented.
@@ -80,7 +82,8 @@ Missing donors are reported. Evidence concerns Price-aligned OI/Volume dependenc
 
 ## Controls and interpretation
 
-`LateFusionControl` independently compresses Minute, Daily, CurrentWeekly and
+`LateFusionControl` uses the minute transformer's existing learned CLS (not mean
+pooling), with the same early minute context projection. It independently compresses Minute, Daily, CurrentWeekly and
 HistoricalWeekly into four vectors. Only then does a 1024→1536→256 MLP fuse them.
 The three higher-scale compressors each use four independent latent queries;
 minute and EMA/predictor topology match S. Exact trainable parameters are
@@ -105,11 +108,24 @@ Formal source claims require independently retrained controls and RB evidence.
 No kNN gate, predictive-state identification claim or automatic checkpoint
 selection is introduced.
 
-The document does not quantify **H16 severe regression**. Architecture PASS can
-be established when H16 has no negative Gain/Skill difference and all other
-conditions pass. If H16 declines, the gate reports
-`BLOCKED_H16_SEVERE_REGRESSION_THRESHOLD_UNDEFINED`; it never invents a tolerance.
-This remaining definition must be frozen before reviewing such a result.
+The subsequent user review freezes **H16 severe regression** as either paired
+Gain or Skill 95% CI upper < 0. Negative points with intervals crossing zero are
+uncertain, not severe. History PASS requires positive H64/H256/RB evidence and
+no significant aggregate negative transfer in Train/RB Gain/Skill. MinuteOnly's
+RB non-regression also uses CI upper < 0, not the point estimate.
+
+Pairwise capacity benefit is `CAPACITY_BENEFIT_VS_S`. Sequence-level
+`V1_1_SCALING_SUPPORTED` requires all S→M, M→L, L→XL Train and RB Gain/Skill
+point differences positive. Adjacent paired CIs are also reported; this label
+does not assert statistical significance of every difference. In-domain-only
+and mixed sequences receive separate labels. The table includes parameters
+against RB Gain/Skill, never absolute latent-loss rankings.
+
+Control checkpoints carry the complete control protocol, its canonical JSON
+SHA256, Full S reference checkpoint SHA256 and sampler count. Evaluation,
+comparison, resume and RB freeze verify this binding. `controls.py` and
+`structure.py` have additional semantic hashes. Old unbound control checkpoints
+are rejected; Full checkpoints keep their existing semantic checks unchanged.
 
 ## RB campaign and local outputs
 
@@ -119,8 +135,19 @@ the frozen checkpoint/probe/evaluation cohort. RB-Test additionally requires a
 human approval JSON with the exact `freeze_sha256`, `human_review_pass: true`
 and `tests_pass: true`. No approval is automatically generated.
 
-The exclusive campaign ledger `rb_test_consumption.json` lives beside the freeze
-file, independently of the result output path. It is marked consumed before
+The only permitted campaign root in this repository is
+`artifacts/evaluation/v1_1_formal_campaign/`. Prepare its `campaign_plan.json`
+from `configs/v1_1/evaluation_campaign_plan.json` for human review. The template
+lists Full S/M/L/XL and all three S controls. Freeze requires the actual cohort
+to equal the plan exactly, with no missing/duplicate models. Plan hashes are
+bound into approval through the freeze hash. Changes require renewed review.
+`freeze-rb --campaign-plan artifacts/evaluation/v1_1_formal_campaign/campaign_plan.json`
+must use `--output artifacts/evaluation/v1_1_formal_campaign/rb_freeze.json`.
+Alternative freeze directories are rejected. This is a repository-local guard,
+not an external registry that can prevent manual deletion or copying a repository.
+
+The exclusive campaign ledger `rb_test_consumption.json` lives in this canonical
+root, independently of the result output path. It is marked consumed before
 model evaluation begins. A failed attempt remains consumed and cannot silently
 restart. All checkpoint/probe/data integrity checks precede consumption.
 The CLI's `rb-test` command is implemented for later review, never run here.
@@ -131,9 +158,13 @@ Train-only runs emit RB files explicitly marked NOT_RUN. `compare` optionally
 accepts matching completed RB-Test outputs and reports paired control/scaling
 differences. Without RB, dependent formal claims remain NOT_EVALUATED.
 
+Structural inference batches donor/recipient pairs per commodity using the CLI
+batch size; all three interventions retain the same clean recipient targets.
+
 W&B is optional (`--wandb-mode online|offline|disabled`), project `market-jepa`,
 group `v1.1-evaluation`. It copies completed local summaries using the existing
-failure-isolated SDK wrapper. Logging errors do not change metrics or gates.
+failure-isolated SDK wrapper. Names include size and control, e.g.
+`v1.1-M-eval` or `v1.1-S-latefusion-eval`. Logging errors do not change metrics or gates.
 
 ## Commands after training and human code review
 
@@ -166,7 +197,8 @@ and use separate outputs. Only a completed S reference is accepted.
 
 After every intended model/control and Train probe is frozen, prepare RB inventory
 with `manifest --rb-inventory`, then use `freeze-rb --checkpoints ... --evaluations ...
---manifest ... --output ...` to bind the whole cohort. `rb-dev --freeze ... --output ...`
+--manifest ... --campaign-plan artifacts/evaluation/v1_1_formal_campaign/campaign_plan.json
+--output artifacts/evaluation/v1_1_formal_campaign/rb_freeze.json` to bind the whole cohort. `rb-dev --freeze ... --output ...`
 is a separate sanity action. Human review and authorization must precede
 `rb-test --freeze ... --approval ... --output ...`. This task stops before those
 formal executions.

@@ -15,9 +15,12 @@ from .metrics import bootstrap, predictive_status
 from .probe import predict_probe
 from .protocol import digest, evaluation_code_hash, file_hash, final_checkpoint_gate, validate_manifest, write_json, verify_data_files, completed_run_gate, semantic_implementation_gate
 from .runner import extract, write_csv
+from .campaign import campaign_plan, exact_cohort
+from .protocol import matched_control_gate
 
 
-def freeze(checkpoints, evaluations, manifest_path, output):
+def freeze(checkpoints, evaluations, manifest_path, output, *, plan_path):
+    expected, plan_hash = campaign_plan(plan_path, output)
     if Path(output).exists():
         raise FileExistsError("frozen campaign already exists")
     if len(checkpoints) != len(evaluations) or not checkpoints:
@@ -27,12 +30,23 @@ def freeze(checkpoints, evaluations, manifest_path, output):
         raise ValueError("RB inventory required")
     models = []
     common = None
+    protocols = []
     for checkpoint, directory in zip(checkpoints, evaluations):
         state = load_v11_checkpoint(checkpoint); final_checkpoint_gate(state, manifest)
+        semantic_implementation_gate(state)
         completed_run_gate(checkpoint, state)
         directory = Path(directory)
         summary = json.loads((directory / "summary.json").read_text())
         protocol = summary["protocol"]
+        if (protocol["model_size"] != state.get("model_size", "S") or
+                protocol["variant"] != state.get("evaluation_variant", "Full")):
+            raise ValueError("evaluation/checkpoint identity mismatch")
+        if (protocol.get("sampler_num_samples") != state["sampler"]["num_samples"] or
+                (protocol["variant"] != "Full" and protocol.get("control_provenance") != state.get("control_provenance"))):
+            raise ValueError("evaluation/checkpoint control provenance mismatch")
+        if json.loads((directory / "evaluation_protocol.json").read_text()) != protocol:
+            raise ValueError("evaluation summary/protocol mismatch")
+        protocols.append(protocol)
         shared = {key: protocol[key] for key in ("manifest_sha256", "epochs", "scaler_sha256", "data_manifest_sha256")}
         if common is not None and common != shared:
             raise ValueError("RB campaign training populations/budgets/scalers are unmatched")
@@ -41,10 +55,19 @@ def freeze(checkpoints, evaluations, manifest_path, output):
             raise ValueError("Train evaluation checkpoint mismatch")
         if protocol["evaluation_code_sha256"] != evaluation_code_hash():
             raise ValueError("evaluation code changed after Train evaluation")
-        models.append({"checkpoint": str(Path(checkpoint).resolve()), "checkpoint_sha256": file_hash(checkpoint),
+        models.append({"model_size": protocol["model_size"], "variant": protocol["variant"],
+                       "checkpoint": str(Path(checkpoint).resolve()), "checkpoint_sha256": file_hash(checkpoint),
                        "train_evaluation": str(directory.resolve()), "probe_sha256": file_hash(directory / "a2_probe_hyperparams.json"),
                        "train_protocol_sha256": file_hash(directory / "evaluation_protocol.json")})
-    payload = {"models": models, "manifest": str(Path(manifest_path).resolve()), "manifest_sha256": manifest["sha256"],
+    exact_cohort([(p["model_size"], p["variant"]) for p in protocols], expected)
+    for p in protocols:
+        if p["variant"] != "Full":
+            references = [r for r in protocols if (r["model_size"], r["variant"]) == ("S", "Full")]
+            if len(references) != 1:
+                raise ValueError("control cohort requires Full S reference")
+            matched_control_gate(p, references[0])
+    payload = {"models": models, "campaign_plan": str(Path(plan_path).resolve()), "campaign_plan_sha256": plan_hash,
+               "manifest": str(Path(manifest_path).resolve()), "manifest_sha256": manifest["sha256"],
                "evaluation_code_sha256": evaluation_code_hash(), "human_review_pass": False,
                "tests_pass": False, "rb_test_consumed": False}
     payload["freeze_sha256"] = digest(payload)
@@ -70,6 +93,10 @@ def run_heldout(freeze_path, output, *, partition, approval=None, device="cpu", 
             raise PermissionError("approval does not match frozen protocol/tests")
     if not frozen.get("models"):
         raise ValueError("empty frozen checkpoint cohort")
+    expected, plan_hash = campaign_plan(frozen["campaign_plan"], freeze_path)
+    if plan_hash != frozen["campaign_plan_sha256"]:
+        raise ValueError("campaign plan changed after freeze")
+    exact_cohort([(m["model_size"], m["variant"]) for m in frozen["models"]], expected)
     manifest = json.loads(Path(frozen["manifest"]).read_text()); validate_manifest(manifest)
     if manifest["sha256"] != frozen["manifest_sha256"]:
         raise ValueError("RB manifest changed")
@@ -85,15 +112,17 @@ def run_heldout(freeze_path, output, *, partition, approval=None, device="cpu", 
         state = load_v11_checkpoint(spec["checkpoint"])
         final_checkpoint_gate(state, manifest)
         semantic_implementation_gate(state)
+        if file_hash(Path(state["v11_config"]["data"]["root"]) / "build_manifest.json") != manifest["data_manifest_sha256"]:
+            raise ValueError("RB data build changed")
         verify_data_files(state["v11_config"]["data"]["root"], ["RB"])
+    records = [r for r in manifest["anchors"] if r["split"] == partition]
+    if not records:
+        raise ValueError("empty heldout partition")
     if partition == "rb_test":
         # Ledger belongs to the frozen campaign, independent of --output choice.
         ledger = Path(freeze_path).resolve().parent / "rb_test_consumption.json"
         with ledger.open("x") as handle:
             json.dump({"rb_test_consumed": True, "state": "STARTED", "freeze_sha256": frozen["freeze_sha256"]}, handle)
-    records = [r for r in manifest["anchors"] if r["split"] == partition]
-    if not records:
-        raise ValueError("empty heldout partition")
     results = []
     for index, spec in enumerate(frozen["models"]):
         state = load_v11_checkpoint(spec["checkpoint"]); final_checkpoint_gate(state, manifest)

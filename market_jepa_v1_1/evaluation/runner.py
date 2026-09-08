@@ -99,11 +99,11 @@ def extract(model, config, scaler, records, device, *, batch_size=8, diagnostics
             kwargs = model_inputs(collate_v11_batch(samples), device)
             with torch.inference_mode():
                 output = model(**kwargs)
-                persistence = model.target_minute(kwargs["minute_market"], kwargs["minute_imc_validity"], kwargs["minute_mask"])
+                persistence = horizon_persistence(model, kwargs)
                 targets = {h: output["targets"][h].cpu().numpy() for h in HORIZONS}
                 exports["belief"].extend(output["z_market"].cpu().numpy())
                 exports["jepa"].extend(np.stack([cosine_loss(output["predictions"][h].cpu().numpy(), targets[h]) for h in HORIZONS], 1))
-                exports["persistence"].extend(np.stack([cosine_loss(persistence.cpu().numpy(), targets[h]) for h in HORIZONS], 1))
+                exports["persistence"].extend(np.stack([cosine_loss(persistence[h].cpu().numpy(), targets[h]) for h in HORIZONS], 1))
                 if diagnostics:
                     for variant in REMOVALS:
                         if variant == "Full": continue
@@ -119,27 +119,36 @@ def extract(model, config, scaler, records, device, *, batch_size=8, diagnostics
     return {k: np.asarray(v) for k, v in exports.items()}, ordered_records
 
 
-def structure_audit(model, config, scaler, records, device):
+def horizon_persistence(model, batch):
+    """V0 continuity: past H bars versus future H bars, retaining online IMC origin."""
+    return {h: model.target_minute(batch["minute_market"][:, -h:],
+                                  batch["minute_imc_validity"][:, -h:],
+                                  batch["minute_mask"][:, -h:]) for h in HORIZONS}
+
+
+def structure_audit(model, config, scaler, records, device, *, batch_size=8):
     mapping = donor_manifest(records)
     errors = {"clean": [], "OI": [], "Volume": [], "Joint": []}
     recipients = []
     for commodity in sorted({records[p["recipient"]]["commodity"] for p in mapping["pairs"]}):
         ds = dataset_for(config, scaler, [commodity])
         pairs = [p for p in mapping["pairs"] if records[p["recipient"]]["commodity"] == commodity]
-        for pair in pairs:
-            rr, dr = records[pair["recipient"]], records[pair["donor"]]
-            ri, di = resolve_records(ds, [rr, dr])
-            recipient, donor = ds[ri[0]], ds[di[0]]
-            kwargs = model_inputs(collate_v11_batch([recipient]), device)
+        for start in range(0, len(pairs), batch_size):
+            chunk = pairs[start:start + batch_size]
+            rr = [records[p["recipient"]] for p in chunk]
+            dr = [records[p["donor"]] for p in chunk]
+            recipient = [ds[item[0]] for item in resolve_records(ds, rr)]
+            donor = [ds[item[0]] for item in resolve_records(ds, dr)]
+            kwargs = model_inputs(collate_v11_batch(recipient), device)
             with torch.inference_mode():
                 clean = model(**kwargs)
                 target = {h: clean["targets"][h].cpu().numpy() for h in HORIZONS}
-                errors["clean"].append([cosine_loss(clean["predictions"][h].cpu().numpy(), target[h])[0] for h in HORIZONS])
+                errors["clean"].extend(np.stack([cosine_loss(clean["predictions"][h].cpu().numpy(), target[h]) for h in HORIZONS], 1))
                 for kind in ("OI", "Volume", "Joint"):
-                    corrupted = replace_channels(recipient, donor, kind)
-                    changed = model(**model_inputs(collate_v11_batch([corrupted]), device))
-                    errors[kind].append([cosine_loss(changed["predictions"][h].cpu().numpy(), target[h])[0] for h in HORIZONS])
-            recipients.append(rr)
+                    corrupted = [replace_channels(r, d, kind) for r, d in zip(recipient, donor)]
+                    changed = model(**model_inputs(collate_v11_batch(corrupted), device))
+                    errors[kind].extend(np.stack([cosine_loss(changed["predictions"][h].cpu().numpy(), target[h]) for h in HORIZONS], 1))
+            recipients.extend(rr)
     reports = {kind: bootstrap(errors[kind], errors["clean"], recipients, difference=True)
                for kind in ("OI", "Volume", "Joint")} if recipients else {}
     return mapping, reports
@@ -219,6 +228,9 @@ def evaluate(checkpoint, manifest_path, output, *, device="cpu", batch_size=8):
                     "batch_size", "max_epochs", "ema_tau", "amp", "amp_dtype")},
                 "rb_test_consumed": False, "precision": "float32", "protocol": PROTOCOL}
     protocol["completion_gate"] = completion
+    protocol["sampler_num_samples"] = state["sampler"]["num_samples"]
+    if variant != "Full":
+        protocol["control_provenance"] = state["control_provenance"]
     protocol["data_integrity"] = data_integrity
     write_json(output / "evaluation_protocol.json", protocol)
     write_json(output / "evaluation_manifest.json", manifest)
@@ -235,7 +247,7 @@ def evaluate(checkpoint, manifest_path, output, *, device="cpu", batch_size=8):
     write_json(output / "a2_bootstrap.json", a2)
     write_csv(output / "a2_probe_results.csv", [r for r in rows if r["representation"] == "belief"])
     write_csv(output / "a2_baselines.csv", [r for r in rows if r["representation"] != "belief"])
-    donors, a3 = structure_audit(model, config, scaler, records, torch.device(device))
+    donors, a3 = structure_audit(model, config, scaler, records, torch.device(device), batch_size=batch_size)
     write_json(output / "a3_donor_manifest.json", {**donors, "manifest_sha256": manifest["sha256"],
         "anchor_order": records})
     write_json(output / "a3_bootstrap.json", a3)
