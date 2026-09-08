@@ -1,4 +1,13 @@
 design_version: "1.1"
+evaluation:
+  stage_a_temporal_oos:
+    enabled: true
+    version: stage_a_temporal_oos_v1
+    split_unit: contract_uid
+    split: [0.70, 0.15, 0.15]
+    test_policy: latest_suffix
+    min_contract_groups: 3
+    probe_anchor_cap_per_commodity: 4096
 model_size: S
 experiment_id: market_jepa_v1_1_development
 data:

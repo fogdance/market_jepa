@@ -7,6 +7,7 @@ from typing import Any
 import yaml
 
 from market_jepa.config import DEFAULT_CONFIG
+from .temporal import STAGE_A_CONFIG
 
 
 TRAIN_COMMODITIES = ("FG", "SA", "JM", "SH", "SP")
@@ -83,6 +84,7 @@ _V11_TRAINING.update({
 })
 
 DEFAULT_V11_CONFIG: dict[str, Any] = {
+    "evaluation": {"stage_a_temporal_oos": deepcopy(STAGE_A_CONFIG)},
     "design_version": "1.1",
     "model_size": "S",
     "experiment_id": "market_jepa_v1_1_development",

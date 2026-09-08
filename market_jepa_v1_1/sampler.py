@@ -107,4 +107,7 @@ def sampling_population_sha256(dataset: V11ContractDataset, data_manifest_sha256
         "population": population,
         "history_week": config["history_week"],
     }
+    split = getattr(dataset, "stage_a_temporal_split", None)
+    if split is not None:
+        payload["stage_a_temporal_split_sha256"] = split["sha256"]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()

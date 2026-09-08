@@ -472,7 +472,13 @@ class V11Trainer:
             "num_samples": cycle_samples, "start_offset": cycle_offset,
             "sampling_population_sha256": self.sampling_population_sha256,
         }
+        from .temporal import training_contracts
+        split = getattr(self.train_dataset, "stage_a_temporal_split", None)
         return {
+            "stage_a_temporal_split_sha256": split["sha256"] if split else None,
+            "stage_a_temporal_split": split,
+            "stage_a_training_contracts": [list(x) for x in training_contracts(self.train_dataset)] if split else None,
+            "stage_a_scaler_selected_anchors": getattr(self.train_dataset, "scaler_selected_anchors", None),
             "design_version": "1.1", "v11_config": deepcopy(self.config),
             "model_size": self.model.model_size,
             "d_model": int(self.model.architecture_config["d_model"]),
@@ -591,6 +597,9 @@ class V11Trainer:
 
     def resume(self, state: dict) -> None:
         validate_v11_checkpoint(state)
+        split = getattr(self.train_dataset, "stage_a_temporal_split", None)
+        if state.get("stage_a_temporal_split_sha256") != (split["sha256"] if split else None):
+            raise ValueError("cannot resume with changed Stage-A temporal split")
         if state.get("training_protocol_version") != FIXED_BUDGET_PROTOCOL:
             raise ValueError(
                 "Cannot resume legacy epoch-budget checkpoint into training_protocol_version="

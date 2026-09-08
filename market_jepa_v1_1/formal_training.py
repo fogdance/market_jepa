@@ -34,6 +34,8 @@ from .development import (
 from .model import MarketJEPAV11
 from .training import V11Trainer
 from .sampler import sampling_population_sha256
+from .temporal import (STAGE_A_CONFIG, build_temporal_split, freeze_split, training_view,
+                       isolation_gate, training_contracts)
 from .wandb_logging import V11WandbLogger, read_persisted_run_id
 
 
@@ -78,6 +80,8 @@ def _git_state() -> tuple[str, bool]:
 
 def validate_formal_training_config(config: dict[str, Any]) -> None:
     validate_v11_config(config)
+    if config.get("evaluation", {}).get("stage_a_temporal_oos") != STAGE_A_CONFIG:
+        raise ValueError("formal training requires frozen Stage-A temporal OOS configuration")
     if Path(config["data"]["root"]).resolve() != FORMAL_DATA_ROOT.resolve():
         raise ValueError(f"formal V1.1 data root must be {FORMAL_DATA_ROOT}")
     history = config["history_week"]
@@ -617,12 +621,36 @@ def run_formal_training(
         raise RuntimeError("formal production data hard gate failed")
     _append_log(log_path, "formal hard-gate audit PASS")
 
+    temporal_split = build_temporal_split(unscaled_train, data_manifest_sha256)
+    freeze_split(output / "stage_a_temporal_split.json", temporal_split)
+    unscaled_train = training_view(unscaled_train, temporal_split)
+    stage_a_audit = {
+        "stage_a_temporal_split_sha256": temporal_split["sha256"],
+        "stage_a_formal_commodities": [c for c, v in temporal_split["commodities"].items() if v["formal_stage_a"]],
+        "stage_a_probe_test_contract_count": sum(len(v["probe_test_contracts"]) for v in temporal_split["commodities"].values()),
+        "stage_a_probe_test_sampler_samples": 0,
+        "stage_a_probe_test_scaler_samples": 0,
+    }
     scaler_selection = _scaler_selection(unscaled_train, scaler_anchors_per_commodity)
     shared_scaler = fit_v11_shared_scaler(unscaled_train, scaler_anchors_per_commodity)
     if set(shared_scaler.fitted_commodities) != set(train_commodities):
         raise RuntimeError("shared scaler fitting population differs from configured Train commodities")
     write_json(output / "shared_imc_scaler.json", shared_scaler.to_dict())
     train_dataset = V11ContractDataset(store, config, role="train", scaler=shared_scaler)
+    full_train_dataset = train_dataset
+    train_dataset = training_view(train_dataset, temporal_split)
+    train_dataset.scaler_selected_anchors = unscaled_train.scaler_selected_anchors
+    isolation_gate({
+        "data_manifest_sha256": data_manifest_sha256,
+        "stage_a_temporal_split_sha256": temporal_split["sha256"],
+        "sampling_population_sha256": sampling_population_sha256(train_dataset, data_manifest_sha256),
+        "stage_a_training_contracts": [list(x) for x in training_contracts(train_dataset)],
+        "stage_a_scaler_selected_anchors": train_dataset.scaler_selected_anchors,
+    }, temporal_split, full_train_dataset)
+    del full_train_dataset
+    data_audit.update(stage_a_audit)
+    write_json(output / "data_audit.json", data_audit)
+    write_json(output / "stage_a_scaler_selected_anchors.json", train_dataset.scaler_selected_anchors)
     if len(train_dataset) != len(unscaled_train):
         raise RuntimeError("scaled dataset population differs from unscaled fitting dataset")
 
@@ -634,7 +662,7 @@ def run_formal_training(
         for commodity in train_commodities
     }
     eligible_counts = {
-        commodity: eligibility["commodities"][commodity]["eligible_contract_count"]
+        commodity: len(train_dataset.hierarchy[commodity])
         for commodity in train_commodities
     }
     filtered_counts = {
@@ -645,6 +673,7 @@ def run_formal_training(
     population_sha256 = sampling_population_sha256(train_dataset, data_manifest_sha256)
     write_json(output / "parameter_counts.json", counts)
     protocol = {
+        **stage_a_audit,
         "design_version": "1.1",
         "model_scale": f"V1.1-{model_size}",
         "git_commit": git_commit,

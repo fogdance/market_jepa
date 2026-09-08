@@ -25,6 +25,11 @@ def v11_implementation_manifest() -> dict:
 
 
 def validate_v11_checkpoint(state: dict) -> None:
+    if state.get("stage_a_temporal_split_sha256"):
+        from .temporal import validate_split
+        validate_split(state["stage_a_temporal_split"], state["data_manifest_sha256"])
+        if state["stage_a_temporal_split_sha256"] != state["stage_a_temporal_split"]["sha256"]:
+            raise ValueError("Stage-A checkpoint split hash mismatch")
     if state.get("design_version") != "1.1":
         raise ValueError('V1.1 checkpoint requires design_version="1.1"')
     common_required = {

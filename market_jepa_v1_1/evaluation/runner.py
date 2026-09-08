@@ -83,8 +83,10 @@ def resolve_records(dataset, records):
     return result
 
 
-def extract(model, config, scaler, records, device, *, batch_size=8, diagnostics=True, rb=False):
+def extract(model, config, scaler, records, device, *, batch_size=8, diagnostics=True, rb=False, export_latents=False, defer_latent_losses=False):
     exports = {key: [] for key in ("belief", "jepa", "persistence", "outcomes", "context", "minute_raw24", "summary")}
+    if export_latents:
+        exports.update({key: [] for key in ("target_latents", "prediction_latents", "persistence_latents")})
     if diagnostics:
         exports.update({"belief_" + variant: [] for variant in REMOVALS if variant != "Full"})
         exports.update({"jepa_" + variant: [] for variant in REMOVALS if variant != "Full"})
@@ -101,9 +103,14 @@ def extract(model, config, scaler, records, device, *, batch_size=8, diagnostics
                 output = model(**kwargs)
                 persistence = horizon_persistence(model, kwargs)
                 targets = {h: output["targets"][h].cpu().numpy() for h in HORIZONS}
+                if export_latents:
+                    exports["target_latents"].extend(np.stack([targets[h] for h in HORIZONS], 1))
+                    exports["prediction_latents"].extend(np.stack([output["predictions"][h].cpu().numpy() for h in HORIZONS], 1))
+                    exports["persistence_latents"].extend(np.stack([persistence[h].cpu().numpy() for h in HORIZONS], 1))
                 exports["belief"].extend(output["z_market"].cpu().numpy())
-                exports["jepa"].extend(np.stack([cosine_loss(output["predictions"][h].cpu().numpy(), targets[h]) for h in HORIZONS], 1))
-                exports["persistence"].extend(np.stack([cosine_loss(persistence[h].cpu().numpy(), targets[h]) for h in HORIZONS], 1))
+                if not defer_latent_losses:
+                    exports["jepa"].extend(np.stack([cosine_loss(output["predictions"][h].cpu().numpy(), targets[h]) for h in HORIZONS], 1))
+                    exports["persistence"].extend(np.stack([cosine_loss(persistence[h].cpu().numpy(), targets[h]) for h in HORIZONS], 1))
                 if diagnostics:
                     for variant in REMOVALS:
                         if variant == "Full": continue

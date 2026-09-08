@@ -864,6 +864,7 @@ def fit_v11_shared_scaler(
     if anchors_per_commodity <= 0:
         raise ValueError("anchors_per_commodity must be positive")
     population: list[tuple[str, str, np.ndarray, np.ndarray]] = []
+    dataset.scaler_selected_anchors = []
     for commodity in dataset.train_commodities:
         episode_indices = dataset.hierarchy.get(commodity, [])
         candidates = [
@@ -878,6 +879,7 @@ def fit_v11_shared_scaler(
         )
         for position in selected:
             sample = dataset[candidates[int(position)]]
+            dataset.scaler_selected_anchors.append(dict(sample["metadata"]))
             for source in ("minute", "daily", "current_weekly", "history_weekly"):
                 population.append((
                     commodity, source,

@@ -12,11 +12,17 @@ from market_jepa_v1_1.evaluation.comparison import compare_runs
 from market_jepa_v1_1.evaluation.heldout import freeze, run_heldout
 from market_jepa_v1_1.evaluation.runner import evaluate, inventory
 from market_jepa_v1_1.evaluation.tracking import log_evaluation
+from market_jepa_v1_1.evaluation.stage_a import run_stage_a
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    stage = commands.add_parser("stage-a", help="Current core gate: Full S strict temporal OOS A0/A1/A2")
+    stage.add_argument("--checkpoint", required=True)
+    stage.add_argument("--output", required=True)
+    stage.add_argument("--device", default="cpu")
+    stage.add_argument("--batch-size", type=int, default=8)
     manifest = commands.add_parser("manifest")
     manifest.add_argument("--config", required=True, help="resolved training config_snapshot.yaml")
     manifest.add_argument("--output", required=True)
@@ -43,7 +49,10 @@ def main():
     if hasattr(args, "batch_size") and args.batch_size <= 0:
         parser.error("--batch-size must be positive")
     torch.set_num_threads(2)
-    if args.command == "manifest":
+    if args.command == "stage-a":
+        result = run_stage_a(args.checkpoint, args.output, device=args.device, batch_size=args.batch_size)
+        print(json.dumps(result, indent=2))
+    elif args.command == "manifest":
         result = inventory(yaml.safe_load(Path(args.config).read_text()), args.output, rb=args.rb_inventory)
         print(json.dumps({"sha256": result["sha256"], "anchors": len(result["anchors"])}))
     elif args.command == "train-domain":

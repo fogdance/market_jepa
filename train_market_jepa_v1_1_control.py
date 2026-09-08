@@ -14,6 +14,7 @@ from market_jepa_v1_1.evaluation.protocol import file_hash, write_json, verify_d
 from market_jepa_v1_1.evaluation.runner import dataset_for
 from market_jepa_v1_1.formal_training import _save_interval_outputs
 from market_jepa_v1_1.imc import SharedIMCScaler
+from market_jepa_v1_1.temporal import training_view, freeze_split
 
 
 def train_control(reference, variant, output, resume=None):
@@ -40,6 +41,10 @@ def train_control(reference, variant, output, resume=None):
     config["training"]["checkpoint_dir"] = str(output / "checkpoints")
     scaler = SharedIMCScaler.from_dict(state["shared_imc_scaler"])
     dataset = dataset_for(config, scaler, config["data"]["train_commodities"])
+    if state.get("stage_a_temporal_split_sha256"):
+        freeze_split(output / "stage_a_temporal_split.json", state["stage_a_temporal_split"])
+        dataset = training_view(dataset, state["stage_a_temporal_split"])
+        dataset.scaler_selected_anchors = state["stage_a_scaler_selected_anchors"]
     configure_determinism(config["training"]["seed"])
     model = control_model(config["model"], variant)
     count = sum(p.numel() for p in model.parameters() if p.requires_grad)
